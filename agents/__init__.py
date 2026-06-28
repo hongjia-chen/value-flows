@@ -8,6 +8,7 @@ from agents.iqn import IQNAgent
 from agents.rebrac import ReBRACAgent
 from agents.sac import SACAgent
 from agents.value_flows import ValueFlowsAgent
+from agents.mav_flows import MAVFlowAgent
 
 agents = dict(
     c51=C51Agent,
@@ -20,4 +21,5 @@ agents = dict(
     rebrac=ReBRACAgent,
     sac=SACAgent,
     value_flows=ValueFlowsAgent,
+    mav_flow = MAVFlowAgent,
 )

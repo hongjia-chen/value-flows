@@ -26,13 +26,22 @@ def get_dataset(
     dataset = d4rl.qlearning_dataset(env)
 
     terminals = np.zeros_like(dataset['rewards'])  # Indicate the end of an episode.
+
+    ## Masks: Bootstrap if the simulator runs out of time. Otherwise the episode is finished/terminal and don't boostrap.
+
     masks = np.zeros_like(dataset['rewards'])  # Indicate whether we should bootstrap from the next state.
     rewards = dataset['rewards'].copy().astype(np.float32)
     if 'antmaze' in env_name:
         for i in range(len(terminals) - 1):
+
+            
+
             terminals[i] = float(
                 np.linalg.norm(dataset['observations'][i + 1] - dataset['next_observations'][i]) > 1e-6
             )
+            
+            ## Masks flip the terminal state. Whenever an episode hasn't ended, we can bootstrap.
+            
             masks[i] = 1 - dataset['terminals'][i]
         rewards = rewards - 1.0
     else:

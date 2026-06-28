@@ -11,3 +11,18 @@ dist/
 debug_video/
 *.mp4
 *.pkl
+
+# Training outputs
+exp/
+wandb/
+
+# Data files
+data/
+*.csv
+
+# Notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Installer binaries
+Miniconda3-*.sh

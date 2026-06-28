@@ -32,7 +32,7 @@ flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
 flags.DEFINE_integer('offline_steps', 1000000, 'Number of offline steps.')
 flags.DEFINE_integer('online_steps', 0, 'Number of online steps.')
 flags.DEFINE_integer('buffer_size', 2000000, 'Replay buffer size.')
-flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
+flags.DEFINE_integer('log_interval', 100, 'Logging interval.') ## Changed log_interval from 5000 to 100 for test runs.
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
 flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
 
@@ -62,7 +62,7 @@ def main(_):
     with open(os.path.join(FLAGS.save_dir, 'flags.json'), 'w') as f:
         json.dump(flag_dict, f)
 
-    # Make environment and datasets.
+    # Make environment and datasets. (Loading train/test datasets using appropriate benchmarks)
     config = FLAGS.agent
     env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=FLAGS.frame_stack)
     if FLAGS.video_episodes > 0:
@@ -74,11 +74,14 @@ def main(_):
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
 
-    # Set up datasets.
+    # Set up datasets. 
     train_dataset = Dataset.create(**train_dataset)
     # Use the training dataset as the replay buffer.
     if FLAGS.balanced_sampling:
         # Create a separate replay buffer so that we can sample from both the training dataset and the replay buffer.
+        # Half the minibatch will be sampled from the training dataset and half from the replay buffer.
+        # Matters for offline-to-online fine-tuning
+        # Used for RLPD: Reinforcement Learning with Prior Data (SAC online from step 0)
         example_transition = {k: v[0] for k, v in train_dataset.items()}
         replay_buffer = ReplayBuffer.create(example_transition, size=FLAGS.buffer_size)
     else:
@@ -87,6 +90,9 @@ def main(_):
             dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1)
         )
     # Set p_aug and frame_stack.
+    # Short frame_stack give the network an approximate Markov state
+    # p_aug is padding the image by a few pixels and crop back the original size
+        # Regularization for smalle camera or pose translations
     for dataset in [train_dataset, val_dataset, replay_buffer]:
         if dataset is not None:
             dataset.p_aug = FLAGS.p_aug
@@ -114,6 +120,10 @@ def main(_):
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
 
     # Train agent.
+
+    ## Two main loops: offline training (i <= FLAGS.offline_steps) 
+    #       and online fine-tuning (i > FLAGS.offline_steps).
+
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'train.csv'))
     eval_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'eval.csv'))
     first_time = time.time()
@@ -124,7 +134,7 @@ def main(_):
     done = True
     for i in tqdm.tqdm(range(1, FLAGS.offline_steps + FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
         if i <= FLAGS.offline_steps:
-            # Offline RL.
+            # Offline RL. This is the gradient step (computes its respective loss)
             batch = train_dataset.sample(config['batch_size'])
             if config['agent_name'] in ['rebrac']:
                 agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))

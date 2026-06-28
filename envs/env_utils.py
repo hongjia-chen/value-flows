@@ -8,6 +8,7 @@ import ogbench
 from gymnasium.spaces import Box
 
 from utils.datasets import Dataset
+from envs import smac_utils
 
 
 class EpisodeMonitor(gymnasium.Wrapper):
@@ -125,6 +126,13 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5):
         eval_env = d4rl_utils.make_env(env_name)
         dataset = d4rl_utils.get_dataset(env, env_name)
         train_dataset, val_dataset = dataset, None
+    elif env_name.startswith('smac_'):
+        env = smac_utils.make_env(env_name)       
+        eval_env = smac_utils.make_env(env_name)  
+        train_dataset = smac_utils.get_dataset(env, env_name)
+        return env, eval_env, train_dataset, None
+        ### Returning (None, None, train_dat, None) for now, should be okay for offline training
+        ## Needs live env for evaluation rollouts and online fine-tuning
     else:
         raise ValueError(f'Unsupported environment: {env_name}')
 

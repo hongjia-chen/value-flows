@@ -15,28 +15,44 @@ from utils.networks import ValueVectorField, ActorVectorField
 class ValueFlowsAgent(flax.struct.PyTreeNode):
     """Value Flows agent."""
 
-    rng: Any
-    network: Any
-    config: Any = nonpytree_field()
+    rng: Any ## JAX random key
+    network: Any ## TranState object that contains the 6 networks
+                        ## Bundles fields such as step, params, optimizer state
+    config: Any = nonpytree_field() ## Don't treat config as JAX array but a static Python data
 
     def critic_loss(self, batch, grad_params, rng):
         """Compute the flow distributional critic loss."""
         batch_size = batch['actions'].shape[0]
         rng, actor_rng, noise_rng, time_rng, q_rng, ret_rng = jax.random.split(rng, 6)
 
-        # Sample next actions using rejection sampling
+        # Sample next actions using rejection sampling from flow-based policy pi_omega
         next_actions = self.sample_actions(batch['next_observations'], actor_rng)
 
         # Using target networks to compute the confidence weights.
+
+        ## Section 4.3 of the paper. 
+        #       Estimate the return variance using flow derivative
+        #       Then turn that into per-transition weight in Eq(7)
+
         ret_noises = jax.random.normal(ret_rng, (batch_size, 1))
+
+
+        ## Roll-out flow return from t = 0 to t = 1;
+        #  Flow derivative simultaneously rolled out; stored in ret_jac_eps_prods1
+        #  Computed using target networks       
         _, ret_jac_eps_prods1 = self.compute_flow_returns(
             ret_noises, batch['observations'], batch['actions'],
             flow_network_name='target_critic_flow1', return_jac_eps_prod=True)
         _, ret_jac_eps_prods2 = self.compute_flow_returns(
             ret_noises, batch['observations'], batch['actions'],
             flow_network_name='target_critic_flow2', return_jac_eps_prod=True)
+        
+        # Estimate the variance with expectation of squared derivative
         ret_stds1 = jnp.sqrt(ret_jac_eps_prods1.squeeze(-1) ** 2)
         ret_stds2 = jnp.sqrt(ret_jac_eps_prods2.squeeze(-1) ** 2)
+
+
+        # Aggregate variance estimates across the two critics. Apply Eq(7)
         if self.config['q_agg'] == 'min':
             ret_stds = jnp.minimum(ret_stds1, ret_stds2)
         else:
@@ -71,13 +87,17 @@ class ValueFlowsAgent(flax.struct.PyTreeNode):
         bcfm_loss = ((vector_field1 - target_vector_field) ** 2 +
                      (vector_field2 - target_vector_field) ** 2).mean(axis=-1)
 
-        # DCFM loss
+        # DCFM loss Eq(5) in paper
+
+        ## Integrating only up to time t; not t = 1
         noisy_next_returns1 = self.compute_flow_returns(
             noises, batch['next_observations'], next_actions, end_times=times,
             flow_network_name='target_critic_flow1')
         noisy_next_returns2 = self.compute_flow_returns(
             noises, batch['next_observations'], next_actions, end_times=times,
             flow_network_name='target_critic_flow2')
+        
+        ## Applies the distributional Bellman shift and scale; Change of variable
         if self.config['ret_agg'] == 'min':
             noisy_next_returns = jnp.minimum(noisy_next_returns1, noisy_next_returns2)
         else:
@@ -86,6 +106,8 @@ class ValueFlowsAgent(flax.struct.PyTreeNode):
             jnp.expand_dims(batch['rewards'], axis=-1) +
             self.config['discount'] * jnp.expand_dims(batch['masks'], axis=-1) * noisy_next_returns
         )
+
+        ## Forward passes on current critic and target critic;
         vector_field1 = self.network.select('critic_flow1')(
             noisy_returns, times, batch['observations'], batch['actions'], params=grad_params)
         vector_field2 = self.network.select('critic_flow2')(
@@ -105,7 +127,7 @@ class ValueFlowsAgent(flax.struct.PyTreeNode):
         critic_loss = (self.config['bcfm_lambda'] * bcfm_loss + self.config['dcfm_lambda'] * dcfm_loss)
         critic_loss = (weights * critic_loss).mean()
 
-        # For logging and confidence weights.
+        # Q-estimation. For logging and confidence weights.
         q_noises = jax.random.normal(q_rng, (batch_size, 1))
         q1 = (q_noises + self.network.select('critic_flow1')(
             q_noises, jnp.zeros_like(q_noises), batch['observations'], batch['actions'])).squeeze(-1)
@@ -240,6 +262,11 @@ class ValueFlowsAgent(flax.struct.PyTreeNode):
             return self.total_loss(batch, grad_params, rng=rng)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+        ## Computes loss and gradients
+        ## Apply the optimizer step using those gradients
+        ## Bundle everything into a new TrainState object (new_network)
+
+        # Polyak update
         self.target_update(new_network, 'critic_flow1')
         self.target_update(new_network, 'critic_flow2')
 
@@ -273,11 +300,19 @@ class ValueFlowsAgent(flax.struct.PyTreeNode):
             (noisy_returns, noisy_jac_eps_prod) = carry
 
             times = i * step_size + init_times
+
+            ## jvp: Jacobian vector product. uses auto differentiation; 
+            # computes J(x) * v without calculating the partial derivatives
+
             vector_field, jac_eps_prod = jax.jvp(
+
+                ## Vector field as the function to differentiate
                 lambda ret: self.network.select(flow_network_name)(ret, times, observations, actions),
+                ## Primal: Tuple of inputs to evaluate the function
                 (noisy_returns, ),
+                ## Tangets: Tuple of directional derivative vectors
                 (noisy_jac_eps_prod, ),
-            )
+            ) 
 
             new_noisy_returns = noisy_returns + step_size * vector_field
             new_noisy_jac_eps_prod = noisy_jac_eps_prod + step_size * jac_eps_prod
@@ -291,6 +326,8 @@ class ValueFlowsAgent(flax.struct.PyTreeNode):
             return (new_noisy_returns, new_noisy_jac_eps_prod), None
 
         # Use lax.scan to do the iteration
+        # lax.scan is JAX's for loop. Inputs (func, init, xs) 
+        # where func is the function to apply, init is the initial carry, and xs is the sequence of inputs
         (noisy_returns, noisy_jac_eps_prod), _ = jax.lax.scan(
             func, (noisy_returns, noisy_jac_eps_prod), jnp.arange(self.config['num_flow_steps']))
 
@@ -422,8 +459,15 @@ class ValueFlowsAgent(flax.struct.PyTreeNode):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
+        ## Looks at an example of dataset to get the dimensions
+        ## This is used to initialize the networks with the correct input/output dimensions
+
+
         ex_observations = example_batch['observations']
         ex_actions = example_batch['actions']
+
+        ## Slicing to get some (B, 1) array for network initialization
+
         ex_returns = ex_actions[..., :1]
         ex_times = ex_actions[..., :1]
         ob_dims = ex_observations.shape[1:]
@@ -431,7 +475,8 @@ class ValueFlowsAgent(flax.struct.PyTreeNode):
         min_reward = example_batch['min_reward']
         max_reward = example_batch['max_reward']
 
-        # Define encoders.
+        # Define encoders for visual tasks
+        ## For OGbench, needs a CNN to map the image to a feature vector
         encoders = dict()
         if config['encoder'] is not None:
             encoder_module = encoder_modules[config['encoder']]
@@ -441,9 +486,16 @@ class ValueFlowsAgent(flax.struct.PyTreeNode):
             encoders['actor_onestep_flow'] = encoder_module()
 
         # Define networks.
+        ## ValueVectorField from networks.py
+        ## MLP that takes in (returns, times, observations, actions) and outputs a scalar value (the vector field)
+
         critic_flow1_def = ValueVectorField(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['value_layer_norm'],
+
+            ## one MLP here, but will have two critics (actually an ensemble of 2)
+            ## Twin-critic trick from TD3; Train two independently and then take min
+
             num_ensembles=1,
             encoder=encoders.get('critic_flow'),
         )
@@ -466,6 +518,11 @@ class ValueFlowsAgent(flax.struct.PyTreeNode):
             num_ensembles=1,
             encoder=encoders.get('target_critic_flow'),
         )
+
+        ## BC flow policy: flow-matching model that generates actions from offlien dataset
+        ## MLP that takes in (observations, actions, times) and outputs an action-space vector (the vector field)
+        ## Integrates via Euler steps to sample an action
+
         actor_flow_def = ActorVectorField(
             hidden_dims=config['actor_hidden_dims'],
             action_dim=action_dim,
@@ -490,7 +547,7 @@ class ValueFlowsAgent(flax.struct.PyTreeNode):
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
-        network_def = ModuleDict(networks)
+        network_def = ModuleDict(networks) 
         network_tx = optax.adam(learning_rate=config['lr'])
         network_params = network_def.init(init_rng, **network_args)['params']
         network = TrainState.create(network_def, network_params, tx=network_tx)
@@ -516,8 +573,14 @@ def get_config():
             max_reward=ml_collections.config_dict.placeholder(float),  # Maximum reward (will be set automatically).
             lr=3e-4,  # Learning rate.
             batch_size=256,  # Batch size.
+
+            ## 4 hidden layers with 512 units each for both actor and critic networks
+
             actor_hidden_dims=(512, 512, 512, 512),  # Actor network hidden dimensions.
             value_hidden_dims=(512, 512, 512, 512),  # Value network hidden dimensions.
+            
+            ## Stabilization trick from FQL/OGBench
+
             actor_layer_norm=True,  # Whether to use layer normalization for the actor.
             value_layer_norm=True,  # Whether to use layer normalization for the value and the critic.
             discount=0.99,  # Discount factor.
