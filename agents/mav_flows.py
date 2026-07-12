@@ -1,8 +1,12 @@
 import copy
 from functools import partial
-from typing import Any
+from logging import config
+from typing import Any, Dict, Sequence
 
 import flax
+import flax.linen as nn
+from flax.linen.initializers import constant, orthogonal
+
 import jax
 import jax.numpy as jnp
 import ml_collections
@@ -35,6 +39,56 @@ from utils.marl_utils import batch_concat_agent_id_to_obs, concat_agent_id_to_ob
 # 4. Confidence weighting
 
 
+## 7/10 - VDN style factorization of joint Q encounters a un-identifiability problem?
+#   We need factorization to be clean -> so that rejection sampling in actor is effective.
+#.  Q-MIX still has identifiability problem. But rejection sampling able to side-step as it only cares about ranking
+
+
+## Q-Mixing Structure ported from JAXMARL library:
+# https://github.com/FLAIROx/JaxMARL/blob/main/baselines/QLearning/qmix_rnn.py
+class HyperNetwork(nn.Module):
+    hidden_dim: int
+    output_dim: int
+    init_scale: float
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(self.hidden_dim, kernel_init=orthogonal(self.init_scale),
+                     bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+        x = nn.Dense(self.output_dim, kernel_init=orthogonal(self.init_scale),
+                     bias_init=constant(0.0))(x)
+        return x
+    
+class MixingNetwork(nn.Module):
+    """QMIX monotonic mixer, no time axis. q_vals (B,K), states (B,state_dim) -> (B,1)."""
+    embedding_dim: int
+    hypernet_hidden_dim: int
+    init_scale: float
+
+    @nn.compact
+    def __call__(self, q_vals, states):
+        # q_vals: (B, K)   states: (B, state_dim)
+        B, K = q_vals.shape
+
+        w_1 = HyperNetwork(self.hypernet_hidden_dim, self.embedding_dim * K,
+                           self.init_scale)(states)
+        b_1 = nn.Dense(self.embedding_dim, kernel_init=orthogonal(self.init_scale),
+                       bias_init=constant(0.0))(states)
+        w_2 = HyperNetwork(self.hypernet_hidden_dim, self.embedding_dim,
+                           self.init_scale)(states)
+        b_2 = HyperNetwork(self.embedding_dim, 1, self.init_scale)(states)
+
+        # monotonicity via |w|, reshape (no time axis)
+        w_1 = jnp.abs(w_1).reshape(B, K, self.embedding_dim)   # (B, K, E)
+        b_1 = b_1.reshape(B, 1, self.embedding_dim)            # (B, 1, E)
+        w_2 = jnp.abs(w_2).reshape(B, self.embedding_dim, 1)   # (B, E, 1)
+        b_2 = b_2.reshape(B, 1, 1)                             # (B, 1, 1)
+
+        hidden = nn.elu(jnp.matmul(q_vals[:, None, :], w_1) + b_1)  # (B,1,E)
+        q_tot = jnp.matmul(hidden, w_2) + b_2                       # (B,1,1)
+        return q_tot.reshape(B, 1)   
+
 class MAVFlowAgent(flax.struct.PyTreeNode):
     """MAV-Flow agent: distributional flow critic for cooperative MARL."""
     
@@ -42,84 +96,35 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
     network: Any
     config: Any = nonpytree_field()
 
-    def joint_critic_bcfm_loss(self, batch, grad_params, rng):
-
-        batch_size = batch['actions'].shape[0]
-        K = self.config['num_agents']
-        A = self.config['action_dim']
-        rng, action_rng, target_noise_rng, bcfm_noise_rng, time_rng = jax.random.split(rng, 5)
-        
-        # target_noise_rng -> ε for target critic single-step trick
-        # bcfm_noise_rng   -> ε for BCFM noise sample
-        # time_rng         -> t for flow interpolation
-
-
-        states = batch['states']
-        next_states = batch['next_states']
-        actions_oh = jax.nn.one_hot(batch['actions'], A)
-        joint_actions = actions_oh.reshape(batch_size, K * A)
-
-        rng, action_rng = jax.random.split(rng)
-        next_obs_with_id = batch_concat_agent_id_to_obs(batch['next_observations'])
-        next_actions_int = self.sample_actions(
-            next_obs_with_id, batch['next_legals'], action_rng)
-        next_actions_oh = jax.nn.one_hot(next_actions_int, A)
-        next_joint_actions = next_actions_oh.reshape(batch_size, K * A)
-
-        # Return: use next-state expected Z 
-        next_q_noises = jax.random.normal(target_noise_rng, (batch_size, 1))
-        next_z1 = next_q_noises + self.network.select('target_joint_critic_flow1')(
-            next_q_noises, jnp.zeros_like(next_q_noises), next_states, next_joint_actions)
-        next_z2 = next_q_noises + self.network.select('target_joint_critic_flow2')(
-            next_q_noises, jnp.zeros_like(next_q_noises), next_states, next_joint_actions)
-
-        if self.config['ret_agg'] == 'min':
-            next_returns = jnp.minimum(next_z1, next_z2)
-        else:
-            next_returns = (next_z1 + next_z2) / 2
-
-        # Bellman target: G = r + γ * mask * E[Z_tot(s', a')]
-        returns = (jnp.expand_dims(batch['rewards'], axis=-1)
-                + self.config['discount']
-                * jnp.expand_dims(batch['masks'], axis=-1)
-                * next_returns)                      
-
-        # BCFM regularization loss
-        noises = jax.random.normal(bcfm_noise_rng, (batch_size, 1))   # eps
-        times = jax.random.uniform(time_rng, (batch_size, 1))   # t in [0, 1]
-        noisy_returns = times * returns + (1 - times) * noises  # G_t
-        target_vector_field = returns - noises                  
-
-        vf1 = self.network.select('joint_critic_flow1')(
-            noisy_returns, times, states, joint_actions, params=grad_params)
-        vf2 = self.network.select('joint_critic_flow2')(
-            noisy_returns, times, states, joint_actions, params=grad_params)
-
-        bcfm_loss = ((vf1 - target_vector_field) ** 2
-                    + (vf2 - target_vector_field) ** 2).mean()
-        
-        assert returns.shape == (batch_size, 1)
-        assert noisy_returns.shape == (batch_size, 1)
-        assert vf1.shape == (batch_size, 1) and vf2.shape == (batch_size, 1)
-
-        return bcfm_loss, {
-            'bcfm_loss': bcfm_loss,
-            'returns_mean': returns.mean(),
-            'returns_std': returns.std(),
-            'vf1_mean': vf1.mean(),
-            'vf2_mean': vf2.mean(),
-        }
+        # -------------------- Sinusoidal Embedding (discrete only) -------------------- #
+    def _time_sin_embed(self, ts):
+        kfreq = int(self.config.get('t_embed_frequencies', 8))
+        freqs = jnp.asarray([2 ** i for i in range(kfreq)], dtype=ts.dtype) * jnp.pi
+        ang = ts * freqs
+        return jnp.concatenate([jnp.sin(ang), jnp.cos(ang)], axis=-1)
     
-    def sample_actions(self, obs_with_id, legals, rng):
-        ## Sample discrete actions from the one-step actor with legal-action masking
+
+    def _sample_candidates(self, obs_with_id, legals, rng, num_candidates):
+        """N candidate actions per agent from the multi-step BC flow.
+        Returns cand_int (N, B, K) and cand_oh (N, B, K, A)."""
         B, K = obs_with_id.shape[:2]
         A = self.config['action_dim']
-        noises = jax.random.normal(rng, (B, K, A))
-        # Call WITHOUT params=grad_params — no gradient flows back to actor
-        logits = self.network.select('actor_onestep_flow')(obs_with_id, noises)
-        masked_logits = jnp.where(legals > 0, logits, -1e9)
-        actions_int = jnp.argmax(masked_logits, axis=-1)
-        return actions_int
+        noises = jax.random.normal(rng, (num_candidates, B, K, A))
+        logits = jax.vmap(
+            lambda eps: self._integrate_actor_flow(eps, obs_with_id, 'actor_bc_flow')
+        )(noises)                                                  # (N, B, K, A)
+        masked = jnp.where(legals[None] > 0, logits, -1e9)
+        cand_int = jnp.argmax(masked, axis=-1)                     # (N, B, K)
+        return cand_int, jax.nn.one_hot(cand_int, A)
+
+    def sample_actions_rejection(self, obs_with_id, legals, rng):
+        """Decentralized execution: per-agent q_heads scoring (IGM-consistent)."""
+        N = self.config['num_candidates']
+        cand_int, cand_oh = self._sample_candidates(obs_with_id, legals, rng, N)
+        q = jax.vmap(lambda a: self.network.select('q_heads')(obs_with_id, a))(cand_oh)  # (N, B, K)
+        best = jnp.argmax(q, axis=0)                               # (B, K)
+        return jnp.take_along_axis(cand_int, best[None], axis=0).squeeze(0)
+
 
     def compute_flow_returns(
         self,
@@ -173,132 +178,236 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
             return noisy_returns, noisy_jac_eps_prod
         else:
             return noisy_returns
-    
-    def joint_critic_dcfm_loss(self, batch, grad_params, rng):
+        
+        ## Full ODE integration instead of one-step
+    # One-step conditional mean E[Z | ε], ε is noise at t = 0
+    def joint_critic_bcfm_loss(self, batch, grad_params, rng):
+
         batch_size = batch['actions'].shape[0]
         K = self.config['num_agents']
         A = self.config['action_dim']
-        rng, target_noise_rng, time_rng = jax.random.split(rng, 3)
+        rng, action_rng, target_noise_rng, bcfm_n1_rng, bcfm_n2_rng, t1_rng, t2_rng = jax.random.split(rng, 7)
+        # target_noise_rng -> ε for target critic single-step trick
+        # bcfm_noise_rng   -> ε for BCFM noise sample
+        # time_rng         -> t for flow interpolation
+
 
         states = batch['states']
         next_states = batch['next_states']
         actions_oh = jax.nn.one_hot(batch['actions'], A)
         joint_actions = actions_oh.reshape(batch_size, K * A)
 
-        # Next-action placeholder (same as BCFM; replace with actor in step 4)
-        next_joint_actions = joint_actions  # TODO(step 4): use actor samples
+        next_obs_with_id = batch_concat_agent_id_to_obs(batch['next_observations'])
+        next_actions_int = self.sample_actions_rejection(
+            next_obs_with_id, batch['next_legals'], action_rng)
+        next_actions_oh = jax.nn.one_hot(next_actions_int, A)
+        next_joint_actions = next_actions_oh.reshape(batch_size, K * A)
 
-        times = jax.random.uniform(time_rng, (batch_size, 1))            # t ∈ [0, 1]
-        noises = jax.random.normal(target_noise_rng, (batch_size, 1))    # ε
-
-        # Integrate target critic flow from t=0 to t
-
-        noisy_next_returns1 = self.compute_flow_returns(
-            noises, next_states, next_joint_actions, end_times=times,
-            flow_network_name='target_joint_critic_flow1')
-        noisy_next_returns2 = self.compute_flow_returns(
-            noises, next_states, next_joint_actions, end_times=times,
-            flow_network_name='target_joint_critic_flow2')
+        # Return: use next-state expected Z (Changed to distributional instead)
+        # self.network.select calls on the velocity at a given time, which is the conditional mean
+        next_q_noises = jax.random.normal(target_noise_rng, (batch_size, 1))
+        next_z1 = self.compute_flow_returns(
+            next_q_noises, next_states, next_joint_actions, flow_network_name='target_joint_critic_flow1'
+        )
+        next_z2 = self.compute_flow_returns(
+            next_q_noises, next_states, next_joint_actions, flow_network_name='target_joint_critic_flow2'
+        )
 
         if self.config['ret_agg'] == 'min':
-            noisy_next_returns = jnp.minimum(noisy_next_returns1, noisy_next_returns2)
+            next_returns = jnp.minimum(next_z1, next_z2)
         else:
-            noisy_next_returns = (noisy_next_returns1 + noisy_next_returns2) / 2
+            next_returns = (next_z1 + next_z2) / 2
 
-        # Distributional Bellman change of variables
-        noisy_returns = (jnp.expand_dims(batch['rewards'], axis=-1)
-                        + self.config['discount']
-                        * jnp.expand_dims(batch['masks'], axis=-1)
-                        * noisy_next_returns)                            # (B, 1)
+        next_returns = jax.lax.stop_gradient(next_returns)   # Freezing boostrap target?
+
+        # Bellman target: G = r + γ * mask * E[Z_tot(s', a')]
+        returns = (jnp.expand_dims(batch['rewards'], axis=-1)
+                + self.config['discount']
+                * jnp.expand_dims(batch['masks'], axis=-1)
+                * next_returns)                      
+
+        # Independent CFM noise + time per twin. Both critics regress toward the SAME
+        # bootstrap target `returns` (pessimism preserved) but see it at different
+        # interpolation points, so their gradients decorrelate and the twins stop
+        # collapsing to identical functions.
+        noises1 = jax.random.normal(bcfm_n1_rng, (batch_size, 1))
+        noises2 = jax.random.normal(bcfm_n2_rng, (batch_size, 1))
+        times1  = jax.random.uniform(t1_rng, (batch_size, 1))
+        times2  = jax.random.uniform(t2_rng, (batch_size, 1))
+
+        noisy_returns1 = times1 * returns + (1 - times1) * noises1
+        noisy_returns2 = times2 * returns + (1 - times2) * noises2
+        target_vf1 = returns - noises1
+        target_vf2 = returns - noises2
 
         vf1 = self.network.select('joint_critic_flow1')(
-            noisy_returns, times, states, joint_actions, params=grad_params)
+            noisy_returns1, times1, states, joint_actions, params=grad_params)
         vf2 = self.network.select('joint_critic_flow2')(
-            noisy_returns, times, states, joint_actions, params=grad_params)
+            noisy_returns2, times2, states, joint_actions, params=grad_params)
 
-        # Target critic velocity at next (s', a') — frozen (no grad_params).
-        target_vf1 = self.network.select('target_joint_critic_flow1')(
-            noisy_next_returns, times, next_states, next_joint_actions)
-        target_vf2 = self.network.select('target_joint_critic_flow2')(
-            noisy_next_returns, times, next_states, next_joint_actions)
+        bcfm_loss = ((vf1 - target_vf1) ** 2 + (vf2 - target_vf2) ** 2).mean()
+        
+        assert returns.shape == (batch_size, 1)
+        assert noisy_returns1.shape == (batch_size, 1)
+        assert noisy_returns2.shape == (batch_size, 1)
+        assert vf1.shape == (batch_size, 1) and vf2.shape == (batch_size, 1)
 
-        if self.config['ret_agg'] == 'min':
-            target_vf = jnp.minimum(target_vf1, target_vf2)
-        else:
-            target_vf = (target_vf1 + target_vf2) / 2
-        target_vf = jax.lax.stop_gradient(target_vf)
+        return bcfm_loss, {
+            'bcfm_loss': bcfm_loss,
+            'returns_mean': returns.mean(),
+            'returns_std': returns.std(),
+            'vf1_mean': vf1.mean(),
+            'vf2_mean': vf2.mean(),
+            'vf_twin_std': (vf1 - vf2).std(),
+        }
+    
+    def joint_critic_dcfm_loss(self, batch, grad_params, rng):
+        batch_size = batch['actions'].shape[0]
+        K = self.config['num_agents']
+        A = self.config['action_dim']
+        rng, n1_rng, n2_rng, t1_rng, t2_rng, action_rng = jax.random.split(rng, 6)
 
-        dcfm_loss = ((vf1 - target_vf) ** 2 + (vf2 - target_vf) ** 2).mean()
+        states = batch['states']
+        next_states = batch['next_states']
+        actions_oh = jax.nn.one_hot(batch['actions'], A)
+        joint_actions = actions_oh.reshape(batch_size, K * A)
+
+        next_obs_with_id = batch_concat_agent_id_to_obs(batch['next_observations'])
+        next_actions_int = self.sample_actions_rejection(
+            next_obs_with_id, batch['next_legals'], action_rng)
+        next_actions_oh = jax.nn.one_hot(next_actions_int, A)
+        next_joint_actions = next_actions_oh.reshape(batch_size, K * A)
+
+        times1 = jax.random.uniform(t1_rng, (batch_size, 1))
+        times2 = jax.random.uniform(t2_rng, (batch_size, 1))
+        noises1 = jax.random.normal(n1_rng, (batch_size, 1))
+        noises2 = jax.random.normal(n2_rng, (batch_size, 1))
+  #
+
+        # Each twin integrates its OWN target flow to its OWN time, then matches that
+        # target's velocity (paired j->j). No shared aggregated velocity target -> no
+        # force pulling the twins together.
+        znext1 = self.compute_flow_returns(
+            noises1, next_states, next_joint_actions, end_times=times1,
+            flow_network_name='target_joint_critic_flow1')
+        znext2 = self.compute_flow_returns(
+            noises2, next_states, next_joint_actions, end_times=times2,
+            flow_network_name='target_joint_critic_flow2')
+
+        r_ = jnp.expand_dims(batch['rewards'], -1)
+        m_ = jnp.expand_dims(batch['masks'], -1)
+        noisy_returns1 = r_ + self.config['discount'] * m_ * znext1
+        noisy_returns2 = r_ + self.config['discount'] * m_ * znext2
+
+        vf1 = self.network.select('joint_critic_flow1')(
+            noisy_returns1, times1, states, joint_actions, params=grad_params)
+        vf2 = self.network.select('joint_critic_flow2')(
+            noisy_returns2, times2, states, joint_actions, params=grad_params)
+
+        target_vf1 = jax.lax.stop_gradient(self.network.select('target_joint_critic_flow1')(
+            znext1, times1, next_states, next_joint_actions))
+        target_vf2 = jax.lax.stop_gradient(self.network.select('target_joint_critic_flow2')(
+            znext2, times2, next_states, next_joint_actions))
+
+        dcfm_loss = ((vf1 - target_vf1) ** 2 + (vf2 - target_vf2) ** 2).mean()
 
         # --- Shape assertions ---
-        assert noisy_next_returns.shape == (batch_size, 1)
-        assert noisy_returns.shape == (batch_size, 1)
+        assert znext1.shape == (batch_size, 1)
+        assert noisy_returns1.shape == (batch_size, 1)
         assert vf1.shape == (batch_size, 1) and vf2.shape == (batch_size, 1)
-        assert target_vf.shape == (batch_size, 1)
+        assert target_vf1.shape == (batch_size, 1)
 
         return dcfm_loss, {
             'dcfm_loss': dcfm_loss,
-            'noisy_next_returns_mean': noisy_next_returns.mean(),
-            'noisy_returns_mean': noisy_returns.mean(),
-            'target_vf_mean': target_vf.mean(),
+            'noisy_next_returns_mean': ((znext1 + znext2) / 2).mean(),
+            'noisy_returns_mean': ((noisy_returns1 + noisy_returns2) / 2).mean(),
+            'target_vf1_mean': target_vf1.mean(),
+            'target_vf2_mean': target_vf2.mean(),
             'vf1_mean': vf1.mean(),
             'vf2_mean': vf2.mean(),
+            'vf_twin_std': (vf1 - vf2).std(),
         }
     
     def q_head_factorization_loss(self, batch, grad_params, rng):
-        ## Distilling V_joint (teacher), Expectation of Z_joint(s,a) into student q-values
-        # Sum q-values to follow IGM (VDN-style, per-agent head)
-        # Loss is MSE between student and teacher
+    ## Distill V_joint = E[Z_joint(s,a)] into a QMIX-factored value, trained at
+    ## BOTH the dataset action AND several BC-sampled candidate actions, so the
+    ## per-agent heads can RANK off-dataset (but in-support) actions — makes
+    ## rejection sampling more effective.
+
+        # Originally, Q-head network is only trained on one joint action from the offline dataset (given any state)
+        # Rejection sampling is ranking samples from BC flow -> will be difficult to identify truth against one sample point
+        # Sample actions from BC Flow
 
         batch_size = batch['actions'].shape[0]
         K = self.config['num_agents']
         A = self.config['action_dim']
-        rng, q_rng = jax.random.split(rng)
+        rng, q_rng, cand_rng = jax.random.split(rng, 3)
 
         states = batch['states']
-        actions_oh = jax.nn.one_hot(batch['actions'], A)
-        joint_actions = actions_oh.reshape(batch_size, K * A)
-
-        # Teacher: expectation on main joint critic (V_joint)
-        q_noises = jax.random.normal(q_rng, (batch_size, 1))
-        z1 = q_noises + self.network.select('joint_critic_flow1')(
-        q_noises, jnp.zeros_like(q_noises), states, joint_actions)       
-        z2 = q_noises + self.network.select('joint_critic_flow2')(
-        q_noises, jnp.zeros_like(q_noises), states, joint_actions)
-
-        if self.config['clip_flow_returns']:
-            return_min = self.config['min_reward'] / (1 - self.config['discount'])
-            return_max = self.config['max_reward'] / (1 - self.config['discount'])
-            z1 = jnp.clip(z1, return_min, return_max)
-            z2 = jnp.clip(z2, return_min, return_max)
-        
-        if self.config['q_agg'] == 'min':
-            v_teacher = jnp.minimum(z1, z2)
-        else:
-            v_teacher = (z1 + z2) / 2
-
-        v_teacher = jax.lax.stop_gradient(v_teacher)   
-
-        # VDN sum over per-agent Q-heads
         obs_with_id = batch_concat_agent_id_to_obs(batch['observations'])     # (B, K, obs_dim + K)
+        actions_oh = jax.nn.one_hot(batch['actions'], A)
+
+        return_min = self.config['min_reward'] / (1 - self.config['discount'])
+        return_max = self.config['max_reward'] / (1 - self.config['discount'])
+
+        def teacher_V(a_oh):
+            ## Expectation of joint return distribution E[Z_joint(s,a)]; using 4 samples for some variance reduction
+            joint_a = a_oh.reshape(batch_size, K * A)
+            L = self.config['teacher_mc_samples']
+            eps = jax.random.normal(q_rng, (L, batch_size, 1))   # L independent draws
+
+            def one_step(e):
+                z1 = e + self.network.select('joint_critic_flow1')(
+                    e, jnp.zeros_like(e), states, joint_a)
+                z2 = e + self.network.select('joint_critic_flow2')(
+                    e, jnp.zeros_like(e), states, joint_a)
+                if self.config['clip_flow_returns']:
+                    z1 = jnp.clip(z1, return_min, return_max)
+                    z2 = jnp.clip(z2, return_min, return_max)
+                return z1, z2
+
+            z1, z2 = jax.vmap(one_step)(eps)          # each (L, batch_size, 1)
+            z1 = z1.mean(axis=0)                       # average over MC draws -> (B, 1)
+            z2 = z2.mean(axis=0)
+            V = jnp.minimum(z1, z2) if self.config['q_agg'] == 'min' else (z1 + z2) / 2
+            return jax.lax.stop_gradient(V)
+        
+        def student_Q(a_oh):
+            ## factorizes into per-agent q_i, with local observations; Q-MIX
+            q_pa = self.network.select('q_heads')(obs_with_id, a_oh, params=grad_params)
+            return self.network.select('mixer')(q_pa, states, params=grad_params)
+
+
+        # Dataset action
+        V_data = teacher_V(actions_oh)
+        Q_data = student_Q(actions_oh)
+        loss_data = ((Q_data - V_data) ** 2).mean()
+
+        # BC-sampled candidate actions
+        N_q = self.config['num_q_candidates']
+        _, cand_oh = self._sample_candidates(
+            obs_with_id, batch['legals'], cand_rng, N_q)        # (N_q, B, K, A)
+        V_cand = jax.vmap(teacher_V)(cand_oh)                    # (N_q, B, 1)
+        Q_cand = jax.vmap(student_Q)(cand_oh)                    # (N_q, B, 1)
+        loss_cand = ((Q_cand - V_cand) ** 2).mean()
+
+        loss = loss_data + loss_cand
+
         q_per_agent = self.network.select('q_heads')(
-            obs_with_id, actions_oh, params=grad_params)                      # (B, K, 1)
-        q_tot_factor = q_per_agent.sum(axis=-1, keepdims = True)
-
-        # MSE Loss
-        loss = ((q_tot_factor - v_teacher) ** 2).mean()
-
-
-        assert q_per_agent.shape == (batch_size, K), f"q_per_agent: {q_per_agent.shape}"
-        assert q_tot_factor.shape == (batch_size, 1), f"q_tot_factor: {q_tot_factor.shape}"
-        assert v_teacher.shape == (batch_size, 1), f"v_teacher: {v_teacher.shape}"
+            obs_with_id, actions_oh, params=grad_params)         # (B, K)
+        
+        assert q_per_agent.shape == (batch_size, K)
+        assert V_data.shape == (batch_size, 1) and Q_data.shape == (batch_size, 1)
 
         return loss, {
-        'q_head_loss': loss,
-        'v_teacher_mean': v_teacher.mean(),
-        'q_tot_factor_mean': q_tot_factor.mean(),
-        'q_per_agent_mean': q_per_agent.mean(),
-        'q_per_agent_std_across_agents': q_per_agent.std(axis=-1).mean(),
+            'q_head_loss': loss,
+            'q_head_loss_data': loss_data,
+            'q_head_loss_cand': loss_cand,
+            'v_teacher_mean': V_data.mean(),
+            'q_tot_factor_mean': Q_data.mean(),
+            'q_per_agent_mean': q_per_agent.mean(),
+            'q_per_agent_std_across_agents': q_per_agent.std(axis=-1).mean(),
+            'v_cand_std': V_cand.std(),   # teacher spread across candidates = ranking signal
         }
     
 
@@ -310,7 +419,8 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         def step_fn(carry, i):
             x = carry
             t = jnp.full(times_shape, i * step_size, dtype=x.dtype)
-            vf = self.network.select(flow_network_name)(observations, x, t)
+            t_embed = self._time_sin_embed(t)
+            vf = self.network.select(flow_network_name)(observations, x, t_embed)
             return x + step_size * vf, None
 
         final, _ = jax.lax.scan(step_fn, noises, jnp.arange(num_steps))
@@ -320,96 +430,44 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
     def actor_loss(self, batch, grad_params, rng):
 
         # BC Flow 
-        # Distillation target
-        # Q-guidance
+        # Rejection Sampling: initiate 16 noises, push through BC flow policy to get actions
+        # Actions are then scored per-agent, taken the argmax. Combined IGM style
+        ## But should the scoring be on the joint? We trained a joint critic?
+        # Is it also computationally too expensive to do the joint? 
+        # All combinations is A^K (A is action space, K is # of agents) - not scalable for SMAVc2 benchmarks with 20 agents
+        
+
+        # Q-guidance: take out for now as we are doing offline RL and not offline-to-online tuning.
+        #  It is a mechansim that pushes the actor towards
+        #  the action that critic scores the highest. 
 
         batch_size = batch['actions'].shape[0]
         K = self.config['num_agents']
         A = self.config['action_dim']
-        alpha = self.config['alpha']
 
-        rng, bc_noise_rng, bc_time_rng, distill_noise_rng, qguide_noise_rng = jax.random.split(rng, 5)
+        rng, bc_noise_rng, bc_time_rng = jax.random.split(rng, 3)
 
 
         obs_with_id = batch_concat_agent_id_to_obs(batch['observations'])     # (B, K, obs_dim + K)
         actions_oh = jax.nn.one_hot(batch['actions'], A)                      # (B, K, A)
-        legals = batch['legals']                                              # (B, K, A)
 
         # 1. BC flow loss — train multi-step actor to imitate dataset
         bc_noises = jax.random.normal(bc_noise_rng, (batch_size, K, A))       # ε in action space
         bc_times = jax.random.uniform(bc_time_rng, (batch_size, K, 1))        # t per agent
         bc_noisy_actions = bc_times * actions_oh + (1 - bc_times) * bc_noises
         bc_target_vf = actions_oh - bc_noises                                 # (B, K, A)
-
+        
+        bc_t_embed = self._time_sin_embed(bc_times)
         bc_vf = self.network.select('actor_bc_flow')(
-            obs_with_id, bc_noisy_actions, bc_times, params=grad_params)      # (B, K, A)
+            obs_with_id, bc_noisy_actions, bc_t_embed, params=grad_params)      # (B, K, A)
+        assert bc_vf.shape == (batch_size, K, A)
 
         bc_loss = ((bc_vf - bc_target_vf) ** 2).mean()
-
-        # 2. Distillation loss — one-step actor matches argmax of multi-step rollout
-        # Integrate multi-step flow from noise to action-space; argmax for target label.
-
-        distill_noises = jax.random.normal(distill_noise_rng, (batch_size, K, A))
-        multistep_logits = self._integrate_actor_flow(
-            distill_noises, obs_with_id, flow_network_name='actor_bc_flow'
-        )                                                                     # (B, K, A)
-        target_labels = jnp.argmax(multistep_logits, axis=-1)                 # (B, K), integer
-        target_labels = jax.lax.stop_gradient(target_labels)
-
-        onestep_logits_for_distill = self.network.select('actor_onestep_flow')(
-            obs_with_id, distill_noises, params=grad_params)                  # (B, K, A)
-
-        # Cross-entropy: -log p(target_label) under one-step actor's softmax
-        log_probs = jax.nn.log_softmax(onestep_logits_for_distill, axis=-1)
-        distill_loss = -jnp.take_along_axis(
-            log_probs, target_labels[..., None], axis=-1
-        ).squeeze(-1).mean()
-
-
-        # 3. Q-guidance loss — one-step actor maximizes Q_tot^fac
-        qguide_noises = jax.random.normal(qguide_noise_rng, (batch_size, K, A))
-        onestep_logits_for_q = self.network.select('actor_onestep_flow')(
-            obs_with_id, qguide_noises, params=grad_params)                   # (B, K, A)
-
-        # Mask illegal actions before softmax
-        masked_logits = jnp.where(legals > 0, onestep_logits_for_q, -1e9)
-        soft_actions = jax.nn.softmax(masked_logits, axis=-1)                 # (B, K, A) differentiable
-
-        # Q-heads called WITHOUT params=grad_params → no gradient to heads
-        q_per_agent = self.network.select('q_heads')(obs_with_id, soft_actions)   # (B, K)
-        q_tot = q_per_agent.sum(axis=-1, keepdims=True)                       # (B, 1)
-
-        if self.config['normalize_q_loss']:
-            # Normalize by absolute Q magnitude (MAC-Flow convention) — keeps Q-loss scale
-            # comparable to BC/distill losses as Q magnitudes drift during training.
-            q_loss = -q_tot.mean() / (jax.lax.stop_gradient(jnp.abs(q_tot).mean()) + 1e-6)
-        else:
-            q_loss = -q_tot.mean()
-
-        # Combine
-        actor_loss = bc_loss + alpha * distill_loss + q_loss
-
-        # --- Shape assertions ---
-        assert bc_vf.shape == (batch_size, K, A)
-        assert multistep_logits.shape == (batch_size, K, A)
-        assert target_labels.shape == (batch_size, K)
-        assert soft_actions.shape == (batch_size, K, A)
-        assert q_tot.shape == (batch_size, 1)
+        actor_loss = bc_loss
 
         return actor_loss, {
             'actor_loss': actor_loss,
             'bc_loss': bc_loss,
-            'distill_loss': distill_loss,
-            'q_loss': q_loss,
-            'q_tot_mean': q_tot.mean(),
-            'multistep_argmax_entropy': -(
-                jax.nn.softmax(multistep_logits, axis=-1)
-                * jax.nn.log_softmax(multistep_logits, axis=-1)
-            ).sum(axis=-1).mean(),
-            'onestep_entropy': -(
-                jax.nn.softmax(masked_logits, axis=-1)
-                * jax.nn.log_softmax(masked_logits, axis=-1)
-            ).sum(axis=-1).mean(),
         }
     
     ## create() needs to 1). extract shapes from transitions, 
@@ -428,6 +486,7 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         ex_states = example_batch['states']
         ex_actions = example_batch['actions']
         ex_legals = example_batch['legals']
+        
 
         num_agents = ex_obs.shape[1]
         ob_dims = ex_obs.shape[-1]
@@ -445,7 +504,23 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
 
         ex_obs_with_id = batch_concat_agent_id_to_obs(ex_obs)        # (1, K, obs_dim + K)
         ex_actor_obs = ex_obs_with_id
-        ex_times_per_agent = jnp.zeros((1, num_agents, 1), dtype = jnp.float32)
+
+        kfreq = int(config.get('t_embed_frequencies', 8))
+        ex_times_per_agent = jnp.zeros((1, num_agents, 2 * kfreq), dtype = jnp.float32)
+
+        num_agents = ex_obs.shape[1]
+        ob_dims    = ex_obs.shape[-1]
+        state_dim  = ex_states.shape[-1]
+        action_dim = ex_legals.shape[-1]
+        # populate config immediately so any config[...] read below is valid
+        config['ob_dims']    = ob_dims
+        config['action_dim'] = action_dim
+        config['num_agents'] = num_agents
+        config['state_dim']  = state_dim
+        config['min_reward'] = min_reward
+        config['max_reward'] = max_reward
+
+        ex_q_vals = jnp.zeros((ex_states.shape[0], num_agents))  # (B, K) for mixer init
 
         ## SMAC doesn't require a CNN encoder; MAC-FLOW uses LSTMs to handle partial observability
 
@@ -483,14 +558,14 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
             num_ensembles=1,
             encoder=None,
             )
+        
+        mixer_def = MixingNetwork(
+            embedding_dim=config['mixer_embed_dim'],
+            hypernet_hidden_dim=config['mixer_hypernet_hidden_dim'],
+            init_scale=config['mixer_init_scale'],
+        )
 
         actor_bc_flow_def = ActorVectorField(
-            hidden_dims=config['actor_hidden_dims'],
-            action_dim=action_dim,
-            layer_norm=config['actor_layer_norm'],
-            encoder=None,
-        )
-        actor_onestep_flow_def = ActorVectorField(
             hidden_dims=config['actor_hidden_dims'],
             action_dim=action_dim,
             layer_norm=config['actor_layer_norm'],
@@ -505,8 +580,8 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
             target_joint_critic_flow2=(target_joint_critic_flow2_def, (ex_returns_joint, ex_times_joint, ex_joint_critic_state, ex_actions_joint_oh)),
             ## Q-heads don't see the full state -> preserves IGM
             q_heads=(q_heads_def, (ex_obs_with_id, ex_actions_per_agent_oh)),
+            mixer=(mixer_def, (ex_q_vals, ex_states)),
             actor_bc_flow=(actor_bc_flow_def, (ex_actor_obs, ex_actions_per_agent_oh, ex_times_per_agent)),
-            actor_onestep_flow=(actor_onestep_flow_def, (ex_actor_obs, ex_actions_per_agent_oh)),
         )
 
         networks = {k: v[0] for k, v in network_info.items()}
@@ -520,15 +595,6 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
 
         network = TrainState.create(network_def, network_params, tx=network_tx)
 
-        
-
-
-        config['ob_dims'] = ob_dims
-        config['action_dim'] = action_dim
-        config['num_agents'] = num_agents
-        config['state_dim'] = state_dim
-        config['min_reward'] = min_reward
-        config['max_reward'] = max_reward
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
     
     def total_loss(self, batch, grad_params, rng):
@@ -611,7 +677,15 @@ def get_config():
             alpha=10.0,  # Flow distillation coefficient.
             normalize_q_loss=True,  # Whether to normalize the Q loss.
             num_flow_steps=10,  # Number of flow steps.
+            mixer_embed_dim=32,            # QMIX mixing embedding dim
+            mixer_hypernet_hidden_dim=64,  # hypernetwork hidden width
+            mixer_init_scale=1.0,          # orthogonal init scale for mixer/hypernet
+            num_candidates = 16, # Number of candidate actions for rejection sampling
+            num_q_candidates = 4, # Number of sampled candidates to train q-heads 
+            t_embed_frequencies = 8, # Number of frequencies for sinusoidal time embedding
+            teacher_mc_samples = 4, # Number of MC samples for teacher V estimation
         )
     )
     return config
     
+

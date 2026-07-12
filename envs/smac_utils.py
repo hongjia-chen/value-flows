@@ -15,8 +15,9 @@ from utils.datasets import Dataset
 # )
 # print(path)
 
-from flashbax.vault import Vault
+import os
 import jax
+from flashbax.vault import Vault
 
 ## The datatype is a TrajectoryBufferState
 ## .experience calls the actual data dictionary
@@ -61,26 +62,36 @@ def get_dataset(env, env_name):
     """
     del env
 
+    import os
     parts = env_name.split("_")
-    assert parts[0] == 'smac', f"Expected smac_ prefix, got {env_name}"
     quality = parts[-1].capitalize()
-    map_name = "_".join(parts[1:-1])
 
-    # Load the dataset from the vault
-    vault = Vault(f"/Users/hc33998/Projects/data/og_marl/smac_v1/{map_name}.vlt", vault_uid = quality)
+    if parts[0] == 'smac':
+        env_kind = 'smac_v1'
+        map_name = "_".join(parts[1:-1])
+    elif parts[0] == 'smacv2':
+        env_kind = 'smac_v2'
+        map_name = "_".join(parts[1:-1])
+    else:
+        raise ValueError(f"Unrecognized env_name format: {env_name}")
+
+    data_dir = os.environ.get('OG_MARL_DATA_DIR', os.path.expanduser('~/vaults/og_marl'))
+    vault = Vault(f"{data_dir}/{env_kind}/{map_name}.vlt", vault_uid=quality)
+
     experience = vault.read().experience
     experience = jax.tree.map(np.asarray, experience)
 
     term_raw = experience['terminals'][0, :, 0]  # Indicate the end of an episode.
-    trunc_raw = experience['truncations'][0, :, 0]  # Indicate whether we should bootstrap from the next state.
+    trunc_raw = experience['truncations'][0, :, 0].astype(np.float32)  # Indicate whether we should bootstrap from the next state.
     rewards = experience['rewards'][0, :, 0].astype(np.float32)
-    masks = np.zeros_like(experience['rewards'][0, :, 0])  
 
     ## Any episode end (terminal or time-limit)
     terminals = ((term_raw + trunc_raw) > 0).astype(np.float32)
     ## Only record the real episode ends
     masks = (1.0 - term_raw).astype(np.float32)
 
+    print(f"[MASK CHECK] term*trunc overlap = {(term_raw * trunc_raw).sum():.0f}  "
+          f"(want 0)   n_term={term_raw.sum():.0f}  n_trunc={trunc_raw.sum():.0f}")
 
     ## Need to create next observations
     obs = experience['observations'][0].astype(np.float32)

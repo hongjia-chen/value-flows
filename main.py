@@ -1,16 +1,16 @@
 import os
-
+ 
 import json
 import random
 import time
-
+ 
 import jax
 import numpy as np
 import tqdm
 import wandb
 from absl import app, flags
 from ml_collections import config_flags
-
+ 
 from agents import agents
 from envs.env_utils import make_env_and_datasets
 from utils.datasets import Dataset, ReplayBuffer
@@ -47,6 +47,14 @@ flags.DEFINE_integer('balanced_sampling', 0, 'Whether to use balanced sampling f
 config_flags.DEFINE_config_file('agent', 'agents/value_flows.py', lock_config=False)
 
 
+def _parse_smac_env_name(env_name):
+    parts = env_name.split('_')
+    if parts[0] == 'smac':
+        return ('smac_v1', '_'.join(parts[1:-1]))
+    elif parts[0] == 'smacv2':
+        return ('smac_v2', '_'.join(parts[1:-1]))
+    return None
+
 def main(_):
     # Set up logger.
     exp_name = get_exp_name(FLAGS.seed)
@@ -70,6 +78,14 @@ def main(_):
     if FLAGS.online_steps > 0:
         assert 'visual' not in FLAGS.env_name, 'Online fine-tuning is currently not supported for visual environments.'
 
+    smac_info = _parse_smac_env_name(FLAGS.env_name)
+    is_smac = smac_info is not None
+    if is_smac:
+        from og_marl.environments import get_environment
+        map_source, scenario = smac_info
+        print(f'Building SMAC eval env: {map_source} / {scenario}')
+        eval_env = get_environment('og_marl', map_source, scenario, seed=FLAGS.seed)
+    
     # Initialize agent.
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
@@ -195,7 +211,7 @@ def main(_):
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             if val_dataset is not None:
                 val_batch = val_dataset.sample(config['batch_size'])
-                _, val_info = agent.total_loss(val_batch, grad_params=None)
+                _, val_info = agent.total_loss(val_batch, grad_params=agent.network.params, rng=jax.random.PRNGKey(i))
                 train_metrics.update({f'validation/{k}': v for k, v in val_info.items()})
             train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval
             train_metrics['time/total_time'] = time.time() - first_time
@@ -208,25 +224,38 @@ def main(_):
         # Evaluate agent.
         if FLAGS.eval_interval != 0 and (i == 1 or i % FLAGS.eval_interval == 0):
             eval_metrics = {}
-            if i > FLAGS.offline_steps and config['agent_name'] in ['value_flows']:
-                eval_kwargs = dict(policy_extraction='rpg')
+            if is_smac:
+                # OG-MARL eval via evaluate_smac (matches MAC-Flow's _evaluate)
+                from utils.evaluate_smac import evaluate_smac
+                results = evaluate_smac(
+                    agent=agent, env=eval_env,
+                    num_episodes=FLAGS.eval_episodes, seed=i, verbose=False,
+                )
+                eval_info = {
+                    'mean_episode_return': results['mean_return'],
+                    'std_episode_return': results['std_return'],
+                    'max_episode_return': results['max_return'],
+                    'min_episode_return': results['min_return'],
+                    'mean_episode_length': results['mean_length'],
+                }
+                renders = []
             else:
-                eval_kwargs = dict()
-            eval_info, _, renders = evaluate(
-                agent=agent,
-                env=eval_env,
-                num_eval_episodes=FLAGS.eval_episodes,
-                num_video_episodes=FLAGS.video_episodes,
-                video_frame_skip=FLAGS.video_frame_skip,
-                **eval_kwargs,
-            )
+                if i > FLAGS.offline_steps and config['agent_name'] in ['value_flows']:
+                    eval_kwargs = dict(policy_extraction='rpg')
+                else:
+                    eval_kwargs = dict()
+                eval_info, _, renders = evaluate(
+                    agent=agent, env=eval_env,
+                    num_eval_episodes=FLAGS.eval_episodes,
+                    num_video_episodes=FLAGS.video_episodes,
+                    video_frame_skip=FLAGS.video_frame_skip,
+                    **eval_kwargs,
+                )
             for k, v in eval_info.items():
                 eval_metrics[f'evaluation/{k}'] = v
-
             if FLAGS.video_episodes > 0:
                 video = get_wandb_video(renders=renders)
                 eval_metrics['video'] = video
-
             if FLAGS.enable_wandb:
                 wandb.log(eval_metrics, step=i)
             eval_logger.log(eval_metrics, step=i)
