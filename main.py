@@ -17,6 +17,7 @@ from utils.datasets import Dataset, ReplayBuffer
 from utils.evaluation import evaluate, flatten
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
+from utils.marl_utils import batch_concat_agent_id_to_obs  # churn probe
 
 FLAGS = flags.FLAGS
 
@@ -43,6 +44,10 @@ flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_float('p_aug', None, 'Probability of applying image augmentation.')
 flags.DEFINE_integer('frame_stack', None, 'Number of frames to stack.')
 flags.DEFINE_integer('balanced_sampling', 0, 'Whether to use balanced sampling for online fine-tuning.')
+
+# Churn probe: number of fixed probe states used to measure greedy-policy churn
+# across checkpoints. Set to 0 to disable.
+flags.DEFINE_integer('churn_probe_size', 256, 'Fixed probe-batch size for churn metric (0 disables).')
 
 config_flags.DEFINE_config_file('agent', 'agents/value_flows.py', lock_config=False)
 
@@ -135,6 +140,26 @@ def main(_):
     if FLAGS.restore_path is not None:
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
 
+    # --- Churn probe setup (F1 diagnostic) -------------------------------------
+    # A fixed set of probe states + a fixed RNG key, frozen for the whole run, so
+    # that any change in the greedy action between checkpoints is attributable to
+    # PARAMETER drift, not to different states or different sampling noise.
+    #   churn_vs_prev   : instantaneous instability (flips since last checkpoint)
+    #   churn_vs_anchor : cumulative drift from the first eval checkpoint
+    # Healthy learning -> churn_vs_prev decays to a low floor; the F1 gauge-drift
+    # pathology -> it plateaus high and churn_vs_anchor rises monotonically.
+    # Only meaningful for SMAC (uses sample_actions_rejection); gated accordingly.
+    churn = None
+    if is_smac and FLAGS.churn_probe_size > 0:
+        probe_batch = train_dataset.sample(FLAGS.churn_probe_size)
+        churn = dict(
+            obs_id=batch_concat_agent_id_to_obs(probe_batch['observations']),
+            legals=probe_batch['legals'],
+            key=jax.random.PRNGKey(12345),   # FIXED key: flips are pure param drift
+            prev=None,
+            anchor=None,
+        )
+
     # Train agent.
 
     ## Two main loops: offline training (i <= FLAGS.offline_steps) 
@@ -224,6 +249,24 @@ def main(_):
         # Evaluate agent.
         if FLAGS.eval_interval != 0 and (i == 1 or i % FLAGS.eval_interval == 0):
             eval_metrics = {}
+
+            # --- Churn metric (F1 diagnostic) ---
+            # Runs the greedy policy on a FIXED probe set with a FIXED key, then
+            # diffs the joint actions against the previous checkpoint and the
+            # first (anchor) checkpoint. Pure reads; does not touch training state.
+            if churn is not None:
+                cur_probe = agent.sample_actions_rejection(
+                    churn['obs_id'], churn['legals'], churn['key'])   # (probe_size, K)
+                if churn['prev'] is not None:
+                    eval_metrics['churn/greedy_flip_rate_vs_prev'] = float(
+                        (cur_probe != churn['prev']).mean())
+                if churn['anchor'] is None:
+                    churn['anchor'] = cur_probe   # freeze first eval as the anchor
+                else:
+                    eval_metrics['churn/greedy_flip_rate_vs_anchor'] = float(
+                        (cur_probe != churn['anchor']).mean())
+                churn['prev'] = cur_probe
+
             if is_smac:
                 # OG-MARL eval via evaluate_smac (matches MAC-Flow's _evaluate)
                 from utils.evaluate_smac import evaluate_smac

@@ -117,13 +117,55 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         cand_int = jnp.argmax(masked, axis=-1)                     # (N, B, K)
         return cand_int, jax.nn.one_hot(cand_int, A)
 
+
+    ## Decentralized execution: needs to stay per-agent with local observations
     def sample_actions_rejection(self, obs_with_id, legals, rng):
-        """Decentralized execution: per-agent q_heads scoring (IGM-consistent)."""
         N = self.config['num_candidates']
         cand_int, cand_oh = self._sample_candidates(obs_with_id, legals, rng, N)
         q = jax.vmap(lambda a: self.network.select('q_heads')(obs_with_id, a))(cand_oh)  # (N, B, K)
         best = jnp.argmax(q, axis=0)                               # (B, K)
         return jnp.take_along_axis(cand_int, best[None], axis=0).squeeze(0)
+    
+    def _select_next_joint_action_teacher(self, next_obs_with_id, next_states,
+                                      next_legals, rng):
+        N = self.config.get('num_target_candidates', self.config['num_candidates'])
+        B = next_states.shape[0]
+        K = self.config['num_agents']
+        A = self.config['action_dim']
+        rng, cand_rng, score_rng = jax.random.split(rng, 3)
+
+        # N coordinated candidates from the joint BC flow (same sampler execution uses)
+        _, cand_oh = self._sample_candidates(
+            next_obs_with_id, next_legals, cand_rng, N)      # (N,B,K), (N,B,K,A)
+
+        L = self.config['teacher_mc_samples']
+        use_full_ode = self.config.get('target_select_full_ode', False)
+
+        def score(a_oh, key):
+            joint_a = a_oh.reshape(B, K * A)
+            eps = jax.random.normal(key, (L, B, 1))
+            def one(e):
+                if use_full_ode:                              # 10-step, consistent w/ bootstrap
+                    z1 = self.compute_flow_returns(
+                        e, next_states, joint_a,
+                        flow_network_name='target_joint_critic_flow1')
+                    z2 = self.compute_flow_returns(
+                        e, next_states, joint_a,
+                        flow_network_name='target_joint_critic_flow2')
+                else:                                         # 1-step E[Z|ε], cheap ranking
+                    z1 = e + self.network.select('target_joint_critic_flow1')(
+                        e, jnp.zeros_like(e), next_states, joint_a)
+                    z2 = e + self.network.select('target_joint_critic_flow2')(
+                        e, jnp.zeros_like(e), next_states, joint_a)
+                return jnp.minimum(z1, z2) if self.config['ret_agg'] == 'min' \
+                    else 0.5 * (z1 + z2)
+            return jax.vmap(one)(eps).mean(0)                 # (B, 1)
+
+        keys = jax.random.split(score_rng, N)
+        v_cand = jax.vmap(score)(cand_oh, keys).squeeze(-1)   # (N, B)
+        best = jnp.argmax(v_cand, axis=0)                     # (B,)
+        best_oh = cand_oh[best, jnp.arange(B)]                # (B, K, A) advanced indexing
+        return jax.lax.stop_gradient(best_oh.reshape(B, K * A))
 
 
     def compute_flow_returns(
@@ -198,10 +240,8 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         joint_actions = actions_oh.reshape(batch_size, K * A)
 
         next_obs_with_id = batch_concat_agent_id_to_obs(batch['next_observations'])
-        next_actions_int = self.sample_actions_rejection(
-            next_obs_with_id, batch['next_legals'], action_rng)
-        next_actions_oh = jax.nn.one_hot(next_actions_int, A)
-        next_joint_actions = next_actions_oh.reshape(batch_size, K * A)
+        next_joint_actions = self._select_next_joint_action_teacher(
+            next_obs_with_id, next_states, batch['next_legals'], action_rng)
 
         # Return: use next-state expected Z (Changed to distributional instead)
         # self.network.select calls on the velocity at a given time, which is the conditional mean
@@ -261,6 +301,11 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
             'vf_twin_std': (vf1 - vf2).std(),
         }
     
+
+    ## Training stage, can use centralized state
+    # Therefore, better to not just rejection sample individual actions and join them with IGM
+    # The stitched up rejection sampling action also likely falls out of the support of the joint actions in dataset
+    # Use joint actions, scored by joint critic E[Z_joint(s,a)] 
     def joint_critic_dcfm_loss(self, batch, grad_params, rng):
         batch_size = batch['actions'].shape[0]
         K = self.config['num_agents']
@@ -273,16 +318,14 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         joint_actions = actions_oh.reshape(batch_size, K * A)
 
         next_obs_with_id = batch_concat_agent_id_to_obs(batch['next_observations'])
-        next_actions_int = self.sample_actions_rejection(
-            next_obs_with_id, batch['next_legals'], action_rng)
-        next_actions_oh = jax.nn.one_hot(next_actions_int, A)
-        next_joint_actions = next_actions_oh.reshape(batch_size, K * A)
+        next_joint_actions = self._select_next_joint_action_teacher(
+            next_obs_with_id, next_states, batch['next_legals'], action_rng)
+            
 
         times1 = jax.random.uniform(t1_rng, (batch_size, 1))
         times2 = jax.random.uniform(t2_rng, (batch_size, 1))
         noises1 = jax.random.normal(n1_rng, (batch_size, 1))
         noises2 = jax.random.normal(n2_rng, (batch_size, 1))
-  #
 
         # Each twin integrates its OWN target flow to its OWN time, then matches that
         # target's velocity (paired j->j). No shared aggregated velocity target -> no
@@ -350,16 +393,16 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         return_min = self.config['min_reward'] / (1 - self.config['discount'])
         return_max = self.config['max_reward'] / (1 - self.config['discount'])
 
-        def teacher_V(a_oh):
+        def teacher_V(a_oh, key):
             ## Expectation of joint return distribution E[Z_joint(s,a)]; using 4 samples for some variance reduction
             joint_a = a_oh.reshape(batch_size, K * A)
             L = self.config['teacher_mc_samples']
-            eps = jax.random.normal(q_rng, (L, batch_size, 1))   # L independent draws
+            eps = jax.random.normal(key, (L, batch_size, 1))   # L independent draws
 
             def one_step(e):
-                z1 = e + self.network.select('joint_critic_flow1')(
+                z1 = e + self.network.select('target_joint_critic_flow1')(
                     e, jnp.zeros_like(e), states, joint_a)
-                z2 = e + self.network.select('joint_critic_flow2')(
+                z2 = e + self.network.select('target_joint_critic_flow2')(
                     e, jnp.zeros_like(e), states, joint_a)
                 if self.config['clip_flow_returns']:
                     z1 = jnp.clip(z1, return_min, return_max)
@@ -379,15 +422,16 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
 
 
         # Dataset action
-        V_data = teacher_V(actions_oh)
+        V_data = teacher_V(actions_oh, q_rng)
         Q_data = student_Q(actions_oh)
         loss_data = ((Q_data - V_data) ** 2).mean()
 
         # BC-sampled candidate actions
         N_q = self.config['num_q_candidates']
+        cand_keys = jax.random.split(cand_rng, N_q)
         _, cand_oh = self._sample_candidates(
             obs_with_id, batch['legals'], cand_rng, N_q)        # (N_q, B, K, A)
-        V_cand = jax.vmap(teacher_V)(cand_oh)                    # (N_q, B, 1)
+        V_cand = jax.vmap(teacher_V)(cand_oh, cand_keys)          # (N_q, B, 1)
         Q_cand = jax.vmap(student_Q)(cand_oh)                    # (N_q, B, 1)
         loss_cand = ((Q_cand - V_cand) ** 2).mean()
 
@@ -395,6 +439,27 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
 
         q_per_agent = self.network.select('q_heads')(
             obs_with_id, actions_oh, params=grad_params)         # (B, K)
+        
+        # Per-agent q over the candidate set: (N_q, B, K)
+        q_pa_cand = jax.vmap(
+            lambda a: self.network.select('q_heads')(obs_with_id, a, params=grad_params)
+        )(cand_oh)
+
+        # METRIC 1: does each agent's head actually separate the candidates?
+        # std over the N_q candidates, per agent, then averaged. This is the
+        # execution-time ranking signal. If it collapses toward 0, argmax is noise.
+        q_cand_spread_per_agent = q_pa_cand.std(axis=0).mean()          # scalar
+
+        # METRIC 2a: agreement between per-agent stitched argmax and the teacher's
+        # preferred WHOLE candidate. Fraction of (B) where they coincide.
+        teacher_best = jnp.argmax(V_cand.squeeze(-1), axis=0)          # (B,) best whole candidate by teacher
+        stitched_best = jnp.argmax(q_pa_cand, axis=0)                  # (B, K) per-agent pick
+        # "does every agent's stitched pick land on the teacher's whole-candidate choice?"
+        stitched_matches_teacher = (stitched_best == teacher_best[:, None]).all(axis=-1).mean()
+
+        # METRIC 2b: student-mixer whole-candidate choice vs teacher whole-candidate choice
+        student_best = jnp.argmax(Q_cand.squeeze(-1), axis=0)          # (B,)
+        student_matches_teacher = (student_best == teacher_best).mean()
         
         assert q_per_agent.shape == (batch_size, K)
         assert V_data.shape == (batch_size, 1) and Q_data.shape == (batch_size, 1)
@@ -408,6 +473,9 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
             'q_per_agent_mean': q_per_agent.mean(),
             'q_per_agent_std_across_agents': q_per_agent.std(axis=-1).mean(),
             'v_cand_std': V_cand.std(),   # teacher spread across candidates = ranking signal
+            'q_cand_spread_per_agent': q_cand_spread_per_agent,
+            'stitched_matches_teacher': stitched_matches_teacher,
+            'student_matches_teacher': student_matches_teacher,
         }
     
 
@@ -667,8 +735,8 @@ def get_config():
             discount=0.99,  # Discount factor.
             tau=0.005,  # Target network update rate.
 
-            ret_agg='mean',  # Aggregation method for return values.
-            q_agg='mean',  # Aggregation method for Q values.
+            ret_agg='min',  # Aggregation method for return values.
+            q_agg='min',  # Aggregation method for Q values.
             clip_flow_actions=False,  # Whether to clip the intermediate flow actions.
             clip_flow_returns=True,  # Whether to clip flow returns.
             confidence_weight_temp=0.3,  # Temperature for the confidence weights.
@@ -684,6 +752,8 @@ def get_config():
             num_q_candidates = 4, # Number of sampled candidates to train q-heads 
             t_embed_frequencies = 8, # Number of frequencies for sinusoidal time embedding
             teacher_mc_samples = 4, # Number of MC samples for teacher V estimation
+            num_target_candidates = 8,
+            target_select_full_ode = False,  # Whether to use full ODE integration for target selection
         )
     )
     return config
