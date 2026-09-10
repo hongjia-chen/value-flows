@@ -13,6 +13,43 @@ from tqdm import trange
 from utils.marl_utils import batch_concat_agent_id_to_obs
 
 
+def _extract_smac_win(info):
+    """Return SMAC's explicit terminal win flag, including nested wrappers."""
+    if not isinstance(info, dict):
+        return None
+    for key in ('battle_won', 'won', 'win'):
+        if key in info:
+            value = np.asarray(info[key])
+            if value.size == 1:
+                return bool(value.item())
+            return bool(value.all())
+    for value in info.values():
+        result = _extract_smac_win(value)
+        if result is not None:
+            return result
+    return None
+
+
+def _get_smac_battles_won(env):
+    """Read SMAC's cumulative win counter through OG-MARL wrappers."""
+    current = env
+    visited = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if hasattr(current, 'battles_won'):
+            return int(current.battles_won)
+        get_stats = getattr(current, 'get_stats', None)
+        if callable(get_stats):
+            try:
+                stats = get_stats()
+            except (AttributeError, KeyError, TypeError, ZeroDivisionError):
+                stats = None
+            if isinstance(stats, dict) and 'battles_won' in stats:
+                return int(stats['battles_won'])
+        current = getattr(current, '_environment', None)
+    return None
+
+
 def evaluate_smac(agent, env, num_episodes=50, seed=0, verbose=False):
     """Run num_episodes rollouts. Returns mean episode return.
 
@@ -24,14 +61,15 @@ def evaluate_smac(agent, env, num_episodes=50, seed=0, verbose=False):
         verbose: tqdm progress bar.
 
     Returns:
-        dict with mean_return, std_return, max_return, min_return,
-        mean_length, raw_returns.
+        dict with return statistics, win_rate, mean_length, raw_returns,
+        and raw_wins.
     """
     rng = jax.random.PRNGKey(seed)
-    returns, lengths = [], []
+    returns, lengths, wins = [], [], []
     iterator = trange(num_episodes, desc='SMAC eval', dynamic_ncols=True) if verbose else range(num_episodes)
 
     for _ in iterator:
+        wins_before = _get_smac_battles_won(env)
         obs_dict, info = env.reset()
         agent_names = list(obs_dict.keys())   # e.g. ['agent_0', 'agent_1', 'agent_2']
 
@@ -69,6 +107,17 @@ def evaluate_smac(agent, env, num_episodes=50, seed=0, verbose=False):
                 break
 
         returns.append(episode_return)
+        episode_won = _extract_smac_win(info)
+        if episode_won is None:
+            wins_after = _get_smac_battles_won(env)
+            if wins_before is None or wins_after is None:
+                raise KeyError(
+                    'SMAC exposed neither a terminal win flag nor a cumulative '
+                    'battles_won statistic. '
+                    f'Available info keys: '
+                    f'{tuple(info.keys()) if isinstance(info, dict) else type(info)}')
+            episode_won = wins_after > wins_before
+        wins.append(episode_won)
         lengths.append(episode_len)
 
         if verbose:
@@ -76,6 +125,7 @@ def evaluate_smac(agent, env, num_episodes=50, seed=0, verbose=False):
                 'ret': f'{episode_return:.2f}',
                 'len': episode_len,
                 'mean': f'{np.mean(returns):.2f}',
+                'win': int(episode_won),
             })
 
     return {
@@ -83,6 +133,8 @@ def evaluate_smac(agent, env, num_episodes=50, seed=0, verbose=False):
         'std_return': float(np.std(returns)),
         'max_return': float(np.max(returns)),
         'min_return': float(np.min(returns)),
+        'win_rate': float(np.mean(wins)),
         'mean_length': float(np.mean(lengths)),
         'raw_returns': returns,
+        'raw_wins': wins,
     }

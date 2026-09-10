@@ -18,6 +18,7 @@ from utils.datasets import Dataset
 import os
 import jax
 from flashbax.vault import Vault
+from utils.vault_paths import get_source_vault_dir
 
 ## The datatype is a TrajectoryBufferState
 ## .experience calls the actual data dictionary
@@ -75,8 +76,8 @@ def get_dataset(env, env_name):
     else:
         raise ValueError(f"Unrecognized env_name format: {env_name}")
 
-    data_dir = os.environ.get('OG_MARL_DATA_DIR', os.path.expanduser('~/vaults/og_marl'))
-    vault = Vault(f"{data_dir}/{env_kind}/{map_name}.vlt", vault_uid=quality)
+    data_dir = get_source_vault_dir('og_marl')
+    vault = Vault(str(data_dir / env_kind / f'{map_name}.vlt'), vault_uid=quality)
 
     experience = vault.read().experience
     experience = jax.tree.map(np.asarray, experience)
@@ -133,4 +134,3 @@ def get_dataset(env, env_name):
 #   'rewards': (1, 996366, 3), - Team reward, replicated for each agent
 #   'terminals': (1, 996366, 3), - Replicated terminal state for all agents
 #   'truncations': (1, 996366, 3)} - Replicated time-limit signal for all agents 
-

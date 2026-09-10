@@ -68,6 +68,48 @@ python main.py --env_name=hammer-cloned-v1 --agent=agents/value_flows.py --agent
 python main.py --env_name=visual-cube-double-play-singletask-{task1, task2, task3, task4, task5}-v0 --p_aug=0.5 --frame_stack=3 --agent=agents/value_flows.py --agent.discount=0.995 --agent.encoder=impala_small
 ```
 
+## OMAR MPE Simple Spread
+
+The continuous-action MPE benchmark uses the OMAR Flashbax vault and the
+case-sensitive quality UIDs `Expert`, `Medium`, `Medium-Replay`, and `Random`.
+Keep source-specific vaults under a shared root:
+
+```text
+~/vaults/
+├── og_marl/
+│   ├── smac_v1/
+│   └── smac_v2/
+└── omar/
+    └── mpe/
+        └── simple_spread.vlt/
+            ├── Expert/
+            ├── Medium/
+            ├── Medium-Replay/
+            └── Random/
+```
+
+Download and extract the vault once:
+
+```bash
+export MARL_VAULT_ROOT="$HOME/vaults"
+python -c "from utils.download_vault import download_and_unzip_vault; download_and_unzip_vault('omar', 'mpe', 'simple_spread', dataset_base_dir='$HOME/vaults')"
+```
+
+Run one quality or the complete four-quality suite:
+
+```bash
+python main.py \
+    --env_name=mpe_simple_spread_Medium-Replay \
+    --agent=agents/mav_flows_continuous.py \
+    --online_steps=0
+
+GPU=0 SEEDS="0" OFFLINE_STEPS=500000 scripts/launch_mpe_spread.sh
+```
+
+MPE training is currently offline-only. Evaluation uses a seeded, independent
+environment RNG and the dataset's 25-step horizon. The original discrete
+`agents/mav_flows.py` path remains dedicated to SMAC.
+
 We include the complete hyperparameters for each method below.
 
 ## Value Flows

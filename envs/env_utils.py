@@ -8,7 +8,7 @@ import ogbench
 from gymnasium.spaces import Box
 
 from utils.datasets import Dataset
-from envs import smac_utils
+from envs import mpe_utils, smac_utils
 
 
 class EpisodeMonitor(gymnasium.Wrapper):
@@ -133,6 +133,11 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5):
         return env, eval_env, train_dataset, None
         ### Returning (None, None, train_dat, None) for now, should be okay for offline training
         ## Needs live env for evaluation rollouts and online fine-tuning
+    elif env_name.startswith('mpe_'):
+        env = mpe_utils.make_env(env_name)
+        eval_env = mpe_utils.make_env(env_name)
+        train_dataset = mpe_utils.get_dataset(env, env_name)
+        return env, eval_env, train_dataset, None
     else:
         raise ValueError(f'Unsupported environment: {env_name}')
 

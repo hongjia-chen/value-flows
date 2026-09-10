@@ -34,10 +34,19 @@ flags.DEFINE_integer('offline_steps', 1000000, 'Number of offline steps.')
 flags.DEFINE_integer('online_steps', 0, 'Number of online steps.')
 flags.DEFINE_integer('buffer_size', 2000000, 'Replay buffer size.')
 flags.DEFINE_integer('log_interval', 100, 'Logging interval.') ## Changed log_interval from 5000 to 100 for test runs.
+# 0903: eval used to be 61% of a 500k 3s5z run's wall clock (16.3 h of 26.8 h),
+# because sample_actions_rejection was not jitted. That is fixed in
+# agents/mav_flows.py, and these two defaults cut the remaining eval work ~17x:
+# 500k steps now means 6 evals x 10 episodes instead of 21 x 50.
+# CAVEAT for reported numbers: 3s5z win_rate ran 0.02-0.16 in the 0827 run, i.e.
+# 1-8 wins out of 50. At 10 episodes win_rate can only read 0.0 or 0.1. Pass
+# --eval_episodes=50 --eval_interval=25000 for any run whose curves get published;
+# post-jit that costs ~10 min, not ~16 h.
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
 flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
 
-flags.DEFINE_integer('eval_episodes', 50, 'Number of evaluation episodes.')
+# WAS (pre-0903): flags.DEFINE_integer('eval_episodes', 50, ...)
+flags.DEFINE_integer('eval_episodes', 10, 'Number of evaluation episodes.')
 flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes for each task.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 
@@ -49,6 +58,15 @@ flags.DEFINE_integer('balanced_sampling', 0, 'Whether to use balanced sampling f
 # across checkpoints. Set to 0 to disable.
 flags.DEFINE_integer('churn_probe_size', 256, 'Fixed probe-batch size for churn metric (0 disables).')
 
+# Which recorder produced the SMAC vault being loaded — this selects the eval env
+# and therefore the observation spec, so it must match the vault:
+#   'og_marl' : standard og-marl SMACv1 recording (5m_vs_6m, 3s5z_vs_3s6z, 3m, ...)
+#   'omiga'   : the OMIGA paper's SMACv1 variant (corridor). Its env appends an
+#               agent-id one-hot to each observation and uses per-agent states, so
+#               corridor's obs is 346 rather than the 156 the standard env emits.
+# main() verifies the choice against the dataset and fails fast on a mismatch.
+flags.DEFINE_string('smac_env_source', 'og_marl', "SMAC eval env recorder: 'og_marl' or 'omiga'.")
+
 config_flags.DEFINE_config_file('agent', 'agents/value_flows.py', lock_config=False)
 
 
@@ -59,6 +77,15 @@ def _parse_smac_env_name(env_name):
     elif parts[0] == 'smacv2':
         return ('smac_v2', '_'.join(parts[1:-1]))
     return None
+
+
+def _parse_mpe_env_name(env_name):
+    if not env_name.startswith('mpe_'):
+        return None
+    from envs.mpe_utils import parse_env_name
+
+    scenario, _ = parse_env_name(env_name)
+    return scenario
 
 def main(_):
     # Set up logger.
@@ -85,11 +112,52 @@ def main(_):
 
     smac_info = _parse_smac_env_name(FLAGS.env_name)
     is_smac = smac_info is not None
+    mpe_scenario = _parse_mpe_env_name(FLAGS.env_name)
+    is_mpe = mpe_scenario is not None
+    if is_mpe and FLAGS.online_steps > 0:
+        raise ValueError('MPE currently supports offline training and evaluation only; set --online_steps=0.')
     if is_smac:
         from og_marl.environments import get_environment
         map_source, scenario = smac_info
-        print(f'Building SMAC eval env: {map_source} / {scenario}')
-        eval_env = get_environment('og_marl', map_source, scenario, seed=FLAGS.seed)
+        print(f'Building SMAC eval env: {map_source} / {scenario} '
+              f'(dataset_source={FLAGS.smac_env_source})')
+        eval_env = get_environment(FLAGS.smac_env_source, map_source, scenario, seed=FLAGS.seed)
+
+        # The vaults under smac_v1/ were not all recorded by the same pipeline, and
+        # the recorder determines the observation spec. Picking the wrong source
+        # builds an env whose observations do not match the dataset the agent was
+        # sized from, and the run dies at the FIRST eval (not at startup) inside
+        # sample_actions_rejection with a ScopeParamShapeError -- i.e. hours in.
+        # Fail here instead, with the fix spelled out.
+        #
+        # NEVER reset() the eval env here. SMAC finishes building max_reward inside
+        # init_units() (called from reset) under `if self._episode_count == 0`, and
+        # _episode_count only advances when an episode TERMINATES -- so a probe
+        # reset that never steps lets the first eval episode's reset add every
+        # enemy's health_max+shield_max a SECOND time. That inflates the reward
+        # normalizer max_reward/reward_scale_rate for the whole run and silently
+        # compresses every eval return (0831: 5m_vs_6m capped at 13.25 instead of
+        # 20.00, because max_reward was 800 rather than 530). get_obs_size() is
+        # pure arithmetic over map params set in __init__, so it needs no reset and
+        # does not boot SC2. The OMIGA env returns a list whose [0] is the total
+        # (it folds in the agent-id one-hot); vanilla SMAC returns an int.
+        ds_obs_dim = int(np.asarray(train_dataset['observations']).shape[-1])
+        obs_size = eval_env._environment.get_obs_size()
+        env_obs_dim = int(obs_size[0] if isinstance(obs_size, (list, tuple)) else obs_size)
+        if ds_obs_dim != env_obs_dim:
+            raise ValueError(
+                f'SMAC observation mismatch for {scenario}: the vault provides '
+                f'{ds_obs_dim}-dim observations but the '
+                f'"{FLAGS.smac_env_source}" env provides {env_obs_dim}. The eval '
+                f'env was built by the wrong recorder. Re-run with '
+                f'--smac_env_source=omiga (or =og_marl) to match the vault. '
+                f'Known: 5m_vs_6m/3s5z_vs_3s6z are og_marl, corridor is omiga.')
+        print(f'[OK] SMAC obs parity: dataset={ds_obs_dim} env={env_obs_dim}')
+    elif is_mpe:
+        from envs.mpe_omar import MPEOMAR
+
+        print(f'Building OMAR MPE eval env: simple_spread / seed {FLAGS.seed}')
+        eval_env = MPEOMAR(mpe_scenario, seed=FLAGS.seed)
     
     # Initialize agent.
     random.seed(FLAGS.seed)
@@ -97,19 +165,17 @@ def main(_):
 
     # Set up datasets. 
     train_dataset = Dataset.create(**train_dataset)
-    # Use the training dataset as the replay buffer.
-    if FLAGS.balanced_sampling:
-        # Create a separate replay buffer so that we can sample from both the training dataset and the replay buffer.
-        # Half the minibatch will be sampled from the training dataset and half from the replay buffer.
-        # Matters for offline-to-online fine-tuning
-        # Used for RLPD: Reinforcement Learning with Prior Data (SAC online from step 0)
-        example_transition = {k: v[0] for k, v in train_dataset.items()}
-        replay_buffer = ReplayBuffer.create(example_transition, size=FLAGS.buffer_size)
-    else:
-        # Use the training dataset as the replay buffer.
-        replay_buffer = ReplayBuffer.create_from_initial_dataset(
-            dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1)
-        )
+    replay_buffer = None
+    if FLAGS.online_steps > 0:
+        if FLAGS.balanced_sampling:
+            # RLPD-style online buffer: sample half from the static dataset and half online.
+            example_transition = {k: v[0] for k, v in train_dataset.items()}
+            replay_buffer = ReplayBuffer.create(example_transition, size=FLAGS.buffer_size)
+        else:
+            # Initialize an online replay buffer from the offline dataset.
+            replay_buffer = ReplayBuffer.create_from_initial_dataset(
+                dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1)
+            )
     # Set p_aug and frame_stack.
     # Short frame_stack give the network an approximate Markov state
     # p_aug is padding the image by a few pixels and crop back the original size
@@ -164,6 +230,12 @@ def main(_):
 
     ## Two main loops: offline training (i <= FLAGS.offline_steps) 
     #       and online fine-tuning (i > FLAGS.offline_steps).
+
+        # Jitted validation forward pass. total_loss now runs ~112 ten-step ODE
+    # integrations; eager dispatch would dominate the training loop.
+    val_loss_fn = None
+    if val_dataset is not None:
+        val_loss_fn = jax.jit(lambda ag, b, k: ag.total_loss(b, ag.network.params, k))
 
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'train.csv'))
     eval_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'eval.csv'))
@@ -236,7 +308,7 @@ def main(_):
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             if val_dataset is not None:
                 val_batch = val_dataset.sample(config['batch_size'])
-                _, val_info = agent.total_loss(val_batch, grad_params=agent.network.params, rng=jax.random.PRNGKey(i))
+                _, val_info = val_loss_fn(agent, val_batch, jax.random.PRNGKey(i))
                 train_metrics.update({f'validation/{k}': v for k, v in val_info.items()})
             train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval
             train_metrics['time/total_time'] = time.time() - first_time
@@ -273,6 +345,24 @@ def main(_):
                 results = evaluate_smac(
                     agent=agent, env=eval_env,
                     num_episodes=FLAGS.eval_episodes, seed=i, verbose=False,
+                )
+                eval_info = {
+                    'mean_episode_return': results['mean_return'],
+                    'std_episode_return': results['std_return'],
+                    'max_episode_return': results['max_return'],
+                    'min_episode_return': results['min_return'],
+                    'win_rate': results['win_rate'],
+                    'mean_episode_length': results['mean_length'],
+                }
+                renders = []
+            elif is_mpe:
+                from utils.evaluate_mpe import evaluate_mpe
+
+                results = evaluate_mpe(
+                    agent=agent,
+                    env=eval_env,
+                    num_episodes=FLAGS.eval_episodes,
+                    seed=i,
                 )
                 eval_info = {
                     'mean_episode_return': results['mean_return'],
