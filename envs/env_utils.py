@@ -133,6 +133,13 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5):
         return env, eval_env, train_dataset, None
         ### Returning (None, None, train_dat, None) for now, should be okay for offline training
         ## Needs live env for evaluation rollouts and online fine-tuning
+    elif env_name.startswith(('cognac_', 'mpedisc_')):
+        # Generated datasets (COGNAC, discrete MPE); see envs/marl_harness.py. The eval
+        # env is rebuilt in main.py from the dataset's saved spec.
+        from envs import marl_harness
+
+        train_dataset = marl_harness.get_dataset(env_name)
+        return None, None, train_dataset, None
     elif env_name.startswith('mpe_'):
         env = mpe_utils.make_env(env_name)
         eval_env = mpe_utils.make_env(env_name)

@@ -1,9 +1,6 @@
 import copy
 from functools import partial
-from logging import config
 from typing import Any, Dict, Sequence
-
-from traitlets import This
 
 import flax
 import flax.linen as nn

@@ -68,6 +68,63 @@ python main.py --env_name=hammer-cloned-v1 --agent=agents/value_flows.py --agent
 python main.py --env_name=visual-cube-double-play-singletask-{task1, task2, task3, task4, task5}-v0 --p_aug=0.5 --frame_stack=3 --agent=agents/value_flows.py --agent.discount=0.995 --agent.encoder=impala_small
 ```
 
+## MAV-Flow on SMAC
+
+`agents/mav_flows.py` trains a joint distributional flow critic and per-agent q_heads on
+og-marl SMACv1/SMACv2 datasets and acts by rejection sampling among BC-flow candidates.
+
+**Environment.** Use Python 3.10 and install the exact package set the experiments ran on
+(CUDA 12 jax, plus og-marl, SMAC and SMACv2 pinned to commits):
+
+```bash
+pip install -r requirements_mav_lock.txt
+```
+
+**StarCraft II 4.10 and maps.** Evaluation runs SC2 headless. Install it at `~/StarCraftII`
+(or anywhere, with `SC2PATH` pointing there) and add both map packs to `Maps/SMAC_Maps`
+(the SMACv2 pack provides `32x32_flat.SC2Map`):
+
+```bash
+cd ~ && wget http://blzdistsc2-a.akamaihd.net/Linux/SC2.4.10.zip && unzip -P iagreetotheeula SC2.4.10.zip && rm SC2.4.10.zip
+mkdir -p ~/StarCraftII/Maps/SMAC_Maps && cd ~/StarCraftII/Maps/SMAC_Maps
+wget -O v1.zip https://github.com/oxwhirl/smac/releases/download/v0.1-beta1/SMAC_Maps.zip && unzip -jo v1.zip '*.SC2Map' && rm v1.zip
+wget -O v2.zip https://github.com/oxwhirl/smacv2/releases/download/maps/SMAC_Maps.zip && unzip -jo v2.zip '*.SC2Map' && rm v2.zip
+```
+
+**Datasets.** Download the og-marl vaults the experiments use (~/vaults/og_marl by default;
+the launch script reads `OG_MARL_DATA_DIR`):
+
+```bash
+python -c "
+from utils.download_vault import download_and_unzip_vault as get
+for env, maps in [('smac_v1', ['5m_vs_6m', '3s5z_vs_3s6z']),
+                  ('smac_v2', ['terran_5_vs_5', 'zerg_5_vs_5', 'terran_10_vs_10'])]:
+    for m in maps:
+        get('og_marl', env, m, dataset_base_dir='$HOME/vaults')
+"
+```
+
+**Run.** `1015_mean_launch_500k.sh` runs the current experiment: 5 maps x 3 seeds at 500k
+steps, one job per GPU, about 76 GPU-hours on A4000s. Its header describes the experiment and
+what to compare. Check the setup first with a smoke test (one 200-step job with a short SC2
+eval, about 5-10 minutes), then launch the queue:
+
+```bash
+SMOKE=1 bash 1015_mean_launch_500k.sh
+GPUS="0 1 2 3" bash 1015_mean_launch_500k.sh
+```
+
+A single run without the queue:
+
+```bash
+python main.py --env_name=smac_5m_vs_6m_Good --agent=agents/mav_flows.py --seed=0 \
+    --offline_steps=500000 --eval_interval=100000 --eval_episodes=50 --save_interval=100000
+```
+
+SMACv2 env names are lower-case: `smacv2_terran_5_vs_5_replay`. Runs write to
+`exp/<group>/sd<seed>_*/` (train.csv, eval.csv, params_*.pkl) and log to W&B project
+`value-flows` (offline by default; `wandb sync` uploads them).
+
 ## OMAR MPE Simple Spread
 
 The continuous-action MPE benchmark uses the OMAR Flashbax vault and the

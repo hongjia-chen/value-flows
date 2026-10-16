@@ -116,6 +116,10 @@ def main(_):
     is_mpe = mpe_scenario is not None
     if is_mpe and FLAGS.online_steps > 0:
         raise ValueError('MPE currently supports offline training and evaluation only; set --online_steps=0.')
+    from envs.marl_harness import is_harness_env_name
+    is_harness = is_harness_env_name(FLAGS.env_name)   # cognac_* / mpedisc_*
+    if is_harness and FLAGS.online_steps > 0:
+        raise ValueError('Harness envs support offline training and evaluation only; set --online_steps=0.')
     if is_smac:
         from og_marl.environments import get_environment
         map_source, scenario = smac_info
@@ -158,7 +162,24 @@ def main(_):
 
         print(f'Building OMAR MPE eval env: simple_spread / seed {FLAGS.seed}')
         eval_env = MPEOMAR(mpe_scenario, seed=FLAGS.seed)
-    
+    elif is_harness:
+        from envs.marl_harness import make_eval_env
+
+        # Rebuilt from the dataset's own JSON spec (graph adjacency included), so the
+        # eval task cannot drift from the task the data was generated on.
+        eval_env, harness_meta = make_eval_env(FLAGS.env_name)
+        ds_shapes = (int(train_dataset['observations'].shape[-2]),
+                     int(train_dataset['legals'].shape[-1]),
+                     int(train_dataset['observations'].shape[-1]),
+                     int(train_dataset['states'].shape[-1]))
+        env_shapes = (eval_env.num_agents, eval_env.num_actions, eval_env.obs_dim, eval_env.state_dim)
+        if ds_shapes != env_shapes:
+            raise ValueError(f'{FLAGS.env_name}: dataset (K, A, obs, state)={ds_shapes} but eval '
+                             f'env gives {env_shapes}. Regenerate the dataset.')
+        print(f'[OK] harness parity (K, A, obs, state)={env_shapes}; behaviour data: '
+              f'return {harness_meta["mean_return"]:.3f}, success {harness_meta["success_rate"]}, '
+              f'behaviour {harness_meta["behaviour"]}')
+
     # Initialize agent.
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
@@ -216,7 +237,7 @@ def main(_):
     # pathology -> it plateaus high and churn_vs_anchor rises monotonically.
     # Only meaningful for SMAC (uses sample_actions_rejection); gated accordingly.
     churn = None
-    if is_smac and FLAGS.churn_probe_size > 0:
+    if (is_smac or is_harness) and FLAGS.churn_probe_size > 0:
         probe_batch = train_dataset.sample(FLAGS.churn_probe_size)
         churn = dict(
             obs_id=batch_concat_agent_id_to_obs(probe_batch['observations']),
@@ -354,6 +375,23 @@ def main(_):
                     'win_rate': results['win_rate'],
                     'mean_episode_length': results['mean_length'],
                 }
+                renders = []
+            elif is_harness:
+                from utils.evaluate_marl import evaluate_marl
+
+                results = evaluate_marl(
+                    agent=agent, env=eval_env,
+                    num_episodes=FLAGS.eval_episodes, seed=i,
+                )
+                eval_info = {
+                    'mean_episode_return': results['mean_return'],
+                    'std_episode_return': results['std_return'],
+                    'max_episode_return': results['max_return'],
+                    'min_episode_return': results['min_return'],
+                    'mean_episode_length': results['mean_length'],
+                }
+                if results['success_rate'] is not None:
+                    eval_info['success_rate'] = results['success_rate']
                 renders = []
             elif is_mpe:
                 from utils.evaluate_mpe import evaluate_mpe
