@@ -18,11 +18,8 @@ from utils.marl_utils import batch_concat_agent_id_to_obs, concat_agent_id_to_ob
 
 ## Design Choices
 # 1. Critic Architecture:
-#       Train joint distributional critic -> Then factorize to q values per agent using WQMIX
-#       'uniform' -> w == 1. Previous behaviour, exact no-op. DEFAULT.
-#       'ow'      -> OW-QMIX. w = 1 if V_teacher > Q_student else w_alpha.
-#       'cw'      -> CW-QMIX. w = 1 where [a == argmax_a V_teacher] OR [y > V_teacher
-#                    at that argmax], else w_alpha.
+#       Train joint distributional critic -> Then factorize to q values per agent using QMIX
+#       (unweighted; the WQMIX candidate weights of 0831-0917 were removed 10/19)
 #       
 #           Distill the flow critic into student flows 
 # 2. Actor Architecture: per-agent BC policy flow
@@ -33,13 +30,6 @@ from utils.marl_utils import batch_concat_agent_id_to_obs, concat_agent_id_to_ob
 #       Legal-action masking: -inf on illegal logits
 # 3. Q-guidance: Softmax (relaxed) to allow Q-loss gradients to flow to actors (?)
 
-#   moves the argmax. The fix is to weight the projection toward high-value actions.
-#
-#   Departure from the paper: WQMIX uses binary weights {1, alpha} because its Q_tot is
-#   only consumed by argmax. OURS is consumed by sample_actions_rejection, which RANKS
-#   num_candidates actions -- so we need ordinal accuracy across the whole candidate set,
-#   not just at the top. Binary weights would starve ~15/16 candidates of supervision and
-#   turn the ranking among them into noise. We therefore use a soft (softmax) weight.
 
 
 ## Q-Mixing Structure ported from JAXMARL library:
@@ -59,10 +49,15 @@ class HyperNetwork(nn.Module):
         return x
 
 class MixingNetwork(nn.Module):
-    """QMIX monotonic mixer, no time axis. q_vals (B,K), states (B,state_dim) -> (B,1)."""
+    """QMIX monotonic mixer, no time axis. q_vals (B,K), states (B,state_dim) -> (B,1).
+
+    monotone=False drops the |w| (T1 arm A3, diagnostic only): IGM no longer holds, so
+    the per-agent argmax deployed by sample_actions_rejection is invalid for that arm.
+    """
     embedding_dim: int
     hypernet_hidden_dim: int
     init_scale: float
+    monotone: bool = True
 
     @nn.compact
     def __call__(self, q_vals, states):
@@ -78,9 +73,11 @@ class MixingNetwork(nn.Module):
         b_2 = HyperNetwork(self.embedding_dim, 1, self.init_scale)(states)
 
         # monotonicity via |w|, reshape (no time axis)
-        w_1 = jnp.abs(w_1).reshape(B, K, self.embedding_dim)   # (B, K, E)
+        if self.monotone:
+            w_1, w_2 = jnp.abs(w_1), jnp.abs(w_2)
+        w_1 = w_1.reshape(B, K, self.embedding_dim)            # (B, K, E)
         b_1 = b_1.reshape(B, 1, self.embedding_dim)            # (B, 1, E)
-        w_2 = jnp.abs(w_2).reshape(B, self.embedding_dim, 1)   # (B, E, 1)
+        w_2 = w_2.reshape(B, self.embedding_dim, 1)            # (B, E, 1)
         b_2 = b_2.reshape(B, 1, 1)                             # (B, 1, 1)
 
         hidden = nn.elu(jnp.matmul(q_vals[:, None, :], w_1) + b_1)  # (B,1,E)
@@ -124,8 +121,6 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         NOTE (8/31): actor_bc_flow is per-agent (independent noise, local obs, no
         cross-agent coupling), so these joint candidates are drawn from the PRODUCT OF
         MARGINALS prod_i mu_i(a_i|o_i), not from the joint behaviour policy mu(a|s).
-        See Score Decomposition (arXiv 2505.05968) Prop 4.1: 2 coordinated modes become
-        2^K spurious modes. Not fixed here -- tracked as a separate workstream.
         """
         B, K = obs_with_id.shape[:2]
         A = self.config['action_dim']
@@ -156,6 +151,82 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         q = jax.vmap(lambda a: self.network.select('q_heads')(obs_with_id, a))(cand_oh)  # (N, B, K)
         best = jnp.argmax(q, axis=0)                               # (B, K)
         return jnp.take_along_axis(cand_int, best[None], axis=0).squeeze(0)
+
+    def _teacher_readout(self, states, a_oh, key):
+        """The q_head teacher's decision readout of the joint action a_oh (B, K, A): the
+        one-step E[Z | eps] = eps + v(eps, 0) of both TARGET twins, clipped to the return
+        bounds, averaged over L = teacher_mc_samples draws of eps from `key`, then combined
+        by q_agg. Pass one key for every option compared (CRN). Returns (V, V1, V2), (B, 1)."""
+        B = states.shape[0]
+        K, A = self.config['num_agents'], self.config['action_dim']
+        joint_a = a_oh.reshape(B, K * A)
+        L = self.config['teacher_mc_samples']
+        eps = jax.random.normal(key, (L, B, 1))   # L independent draws
+        return_min = self.config['min_reward'] / (1 - self.config['discount'])
+        return_max = self.config['max_reward'] / (1 - self.config['discount'])
+
+        def one_step(e):
+            z1 = e + self.network.select('target_joint_critic_flow1')(
+                e, jnp.zeros_like(e), states, joint_a)
+            z2 = e + self.network.select('target_joint_critic_flow2')(
+                e, jnp.zeros_like(e), states, joint_a)
+            if self.config['clip_flow_returns']:
+                z1 = jnp.clip(z1, return_min, return_max)
+                z2 = jnp.clip(z2, return_min, return_max)
+            return z1, z2
+
+        z1, z2 = jax.vmap(one_step)(eps)          # each (L, B, 1)
+        z1 = z1.mean(axis=0)                       # average over MC draws -> (B, 1)
+        z2 = z2.mean(axis=0)
+        return aggregate_twins(z1, z2, self.config['q_agg']), z1, z2
+
+    def _ode_readout(self, states, a_oh, key):
+        """Full-ODE mean of Z(s, a): L = teacher_mc_samples endpoints of the 10-step ODE
+        from both TARGET twins, combined by ret_agg -- the readout the bootstrap target y
+        draws from (total_loss). (B, 1)."""
+        B = states.shape[0]
+        K, A = self.config['num_agents'], self.config['action_dim']
+        joint_a = a_oh.reshape(B, K * A)
+        eps = jax.random.normal(key, (self.config['teacher_mc_samples'], B, 1))
+
+        def one(e):
+            z1 = self.compute_flow_returns(e, states, joint_a,
+                                           flow_network_name='target_joint_critic_flow1')
+            z2 = self.compute_flow_returns(e, states, joint_a,
+                                           flow_network_name='target_joint_critic_flow2')
+            return aggregate_twins(z1, z2, self.config['ret_agg'])
+        return jax.vmap(one)(eps).mean(0)
+
+    @jax.jit
+    def eval_step(self, obs_with_id, legals, states, rng):
+        """One eval decision: each eval arm's joint action, plus the readouts the on-policy
+        diagnostics need (utils/evaluate_smac.py). B = 1 at eval.
+
+        The pool and 'deployed' are exactly sample_actions_rejection(obs_with_id, legals,
+        rng), so the deployed arm plays the same actions whether or not it is diagnosed.
+        Arms: 'deployed' (per-agent argmax q_i), 'bc' (candidate 0 == one BC draw, the
+        no-selection floor) and 'teacher' (argmax of the joint critic over the same N
+        candidates; it reads the global state, so it is a centralised reference, not a
+        deployable policy). V* are the teacher readout, one eps set for every option (CRN,
+        key fold_in(rng, 1)); V_ode is the full-ODE mean (key fold_in(rng, 2)).
+        """
+        N = self.config['num_candidates']
+        A = self.config['action_dim']
+        B = obs_with_id.shape[0]
+        cand_int, cand_oh = self._sample_candidates(obs_with_id, legals, rng, N)
+        q = jax.vmap(lambda a: self.network.select('q_heads')(obs_with_id, a))(cand_oh)  # (N, B, K)
+        deployed = jnp.take_along_axis(cand_int, jnp.argmax(q, axis=0)[None], axis=0).squeeze(0)
+
+        k_teach, k_ode = jax.random.fold_in(rng, 1), jax.random.fold_in(rng, 2)
+        V, V1, V2 = jax.vmap(lambda a: self._teacher_readout(states, a, k_teach))(cand_oh)
+        V_ode = jax.vmap(lambda a: self._ode_readout(states, a, k_ode))(cand_oh)
+        dep_oh = jax.nn.one_hot(deployed, A)
+        V_dep = self._teacher_readout(states, dep_oh, k_teach)[0]
+        V_dep_ode = self._ode_readout(states, dep_oh, k_ode)
+        teacher = cand_int[jnp.argmax(V[..., 0], axis=0), jnp.arange(B)]
+        return dict(cand=cand_int, deployed=deployed, bc=cand_int[0], teacher=teacher,
+                    V=V[..., 0], V1=V1[..., 0], V2=V2[..., 0], V_ode=V_ode[..., 0],
+                    V_dep=V_dep[:, 0], V_dep_ode=V_dep_ode[:, 0])
 
     def _select_next_joint_action_teacher(self, next_obs_with_id, next_states,
                                       next_legals, rng):
@@ -208,7 +279,14 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         flow_network_name=None,
         return_jac_eps_prod=False,
     ):
-        """Compute returns from the return flow model using the Euler method."""
+        """Compute returns from the return flow model using the Euler method.
+
+        clip_flow_returns clips only the t=1 endpoint, which is a return sample and so
+        lies in [min_reward, max_reward] / (1 - discount). A partial integration (an
+        explicit end_times, i.e. DCFM's x_t = t*Z + (1-t)*eps) is returned unclipped:
+        x_t is not a return and has no such bound.
+        """
+        integrates_to_endpoint = end_times is None
         noisy_returns = noises
         noisy_jac_eps_prod = jnp.ones_like(noises)
         if init_times is None:
@@ -241,12 +319,6 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
                 new_noisy_jac_eps_prod = noisy_jac_eps_prod
 
             new_noisy_returns = noisy_returns + step_size * vector_field
-            if self.config['clip_flow_returns']:
-                new_noisy_returns = jnp.clip(
-                    new_noisy_returns,
-                    self.config['min_reward'] / (1 - self.config['discount']),
-                    self.config['max_reward'] / (1 - self.config['discount']),
-                )
 
             return (new_noisy_returns, new_noisy_jac_eps_prod), None
 
@@ -254,90 +326,66 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         (noisy_returns, noisy_jac_eps_prod), _ = jax.lax.scan(
             func, (noisy_returns, noisy_jac_eps_prod), jnp.arange(self.config['num_flow_steps']))
 
+        if self.config['clip_flow_returns'] and integrates_to_endpoint:
+            noisy_returns = jnp.clip(
+                noisy_returns,
+                self.config['min_reward'] / (1 - self.config['discount']),
+                self.config['max_reward'] / (1 - self.config['discount']),
+            )
+
         if return_jac_eps_prod:
             return noisy_returns, noisy_jac_eps_prod
         else:
             return noisy_returns
 
-        ## Full ODE integration instead of one-step
+    ## Full ODE integration instead of one-step
     # One-step conditional mean E[Z | ε], ε is noise at t = 0
-    def joint_critic_bcfm_loss(self, batch, grad_params, rng,
+
+        # Check total_loss() for complete implementation.
+        # Drawing a' once and sharing it, beyond the ~30% step-time saving:
+        #
+        # a' is not a random variable the objective integrates over. It is an
+        #      ESTIMATOR of the greedy successor action -- the multi-agent stand-in for
+        #      argmax_{a'} Q(s',a'), approximated by an argmax over BC-flow candidates.
+        #      Its randomness is estimation error, not part of the target distribution.
+        #      BCFM (mean-matching) and DCFM (distributional) are two views of ONE
+        #      Bellman operator T: Z(s,a) <- r + gamma*m*Z_target(s',a').
+
+
+    def joint_critic_bcfm_loss(self, batch, grad_params, noises, times,
                                joint_actions, next_joint_actions, bootstrap_target):
-        """BCFM half of the Bellman backup. `joint_actions`, `next_joint_actions` and
-        `bootstrap_target` (= y) are computed once in total_loss and passed in -- see
-        the note there."""
+        """BCFM half of the Bellman backup. `noises`, `times`, `joint_actions`,
+        `next_joint_actions` and `bootstrap_target` (= y) are computed once in total_loss
+        and passed in -- see the note there. `noises` is the eps that drew y.
+        `next_joint_actions` is unused here: s' and a' reach BCFM only through y."""
 
         batch_size = batch['actions'].shape[0]
-        K = self.config['num_agents']
-        A = self.config['action_dim']
-        # WAS (pre-0903): also split off `action_rng` (its own a') and
-        # `target_noise_rng` (its own y) here --
-        #   rng, action_rng, target_noise_rng, bcfm_n1_rng, bcfm_n2_rng, t1_rng, t2_rng = \
-        #       jax.random.split(rng, 7)
-        rng, bcfm_n1_rng, bcfm_n2_rng, t1_rng, t2_rng = jax.random.split(rng, 5)
-        # bcfm_noise_rng   -> ε for BCFM noise sample
-        # time_rng         -> t for flow interpolation
-
-
         states = batch['states']
-        next_states = batch['next_states']
-
-        # WAS (pre-0903): built locally, duplicating joint_critic_dcfm_loss --
-        #   actions_oh = jax.nn.one_hot(batch['actions'], A)
-        #   joint_actions = actions_oh.reshape(batch_size, K * A)
-        #   next_obs_with_id = batch_concat_agent_id_to_obs(batch['next_observations'])
-        #   next_joint_actions = self._select_next_joint_action_teacher(
-        #       next_obs_with_id, next_states, batch['next_legals'], action_rng)
-
-        # WAS (pre-0903): the bootstrap target was built here, and only here --
-        #   next_q_noises = jax.random.normal(target_noise_rng, (batch_size, 1))
-        #   next_z1 = self.compute_flow_returns(
-        #       next_q_noises, next_states, next_joint_actions,
-        #       flow_network_name='target_joint_critic_flow1')
-        #   next_z2 = self.compute_flow_returns(
-        #       next_q_noises, next_states, next_joint_actions,
-        #       flow_network_name='target_joint_critic_flow2')
-        #   next_returns = jnp.minimum(next_z1, next_z2) if ret_agg == 'min' else ...
-        #   next_returns = jax.lax.stop_gradient(next_returns)
-        #   returns = r + discount * masks * next_returns
-        # It now comes from total_loss, because q_head_factorization_loss needs the
-        # SAME y for the paper-faithful CW-QMIX weighting condition and there is no
-        # reason to integrate the target ODEs twice for it.
-        # Bellman target: G = r + γ * mask * E[Z_tot(s', a')]
         returns = bootstrap_target
 
-        # Independent CFM noise + time per twin. Both critics regress toward the SAME
-        # bootstrap target `returns` (twin-aggregated by ret_agg) but see it at different
-        # interpolation points, so their gradients decorrelate and the twins stop
-        # collapsing to identical functions.
-        noises1 = jax.random.normal(bcfm_n1_rng, (batch_size, 1))
-        noises2 = jax.random.normal(bcfm_n2_rng, (batch_size, 1))
-        times1  = jax.random.uniform(t1_rng, (batch_size, 1))
-        times2  = jax.random.uniform(t2_rng, (batch_size, 1))
-
-        noisy_returns1 = times1 * returns + (1 - times1) * noises1
-        noisy_returns2 = times2 * returns + (1 - times2) * noises2
-        target_vf1 = returns - noises1
-        target_vf2 = returns - noises2
+        # Value Flows noise sharing (value_flows.py:64-88; paper App C.1 fn 4): each path
+        # runs from eps to the return that eps produced, and both twins regress at that
+        # same point. Before 10/19 each twin drew its own (eps, t), independent of y's eps.
+        noisy_returns = times * returns + (1 - times) * noises
+        target_vf = returns - noises
 
         vf1 = self.network.select('joint_critic_flow1')(
-            noisy_returns1, times1, states, joint_actions, params=grad_params)
+            noisy_returns, times, states, joint_actions, params=grad_params)
         vf2 = self.network.select('joint_critic_flow2')(
-            noisy_returns2, times2, states, joint_actions, params=grad_params)
+            noisy_returns, times, states, joint_actions, params=grad_params)
 
-        bcfm_loss = ((vf1 - target_vf1) ** 2 + (vf2 - target_vf2) ** 2).mean()
+        bcfm_loss = ((vf1 - target_vf) ** 2 + (vf2 - target_vf) ** 2).mean()
 
         assert returns.shape == (batch_size, 1)
-        assert noisy_returns1.shape == (batch_size, 1)
-        assert noisy_returns2.shape == (batch_size, 1)
+        assert noisy_returns.shape == (batch_size, 1)
         assert vf1.shape == (batch_size, 1) and vf2.shape == (batch_size, 1)
 
+        # vf_twin_std: both twins regress at the same point since 10/19, so this is a real
+        # twin disagreement (in velocity units). Before 10/19 it sat near sqrt(2) by
+        # construction. Removed 10/19: returns_std, vf1_mean, vf2_mean.
         return bcfm_loss, {
             'bcfm_loss': bcfm_loss,
-            'returns_mean': returns.mean(),
-            'returns_std': returns.std(),
-            'vf1_mean': vf1.mean(),
-            'vf2_mean': vf2.mean(),
+            'returns_mean': returns.mean(),   # mean bootstrap target y
             'vf_twin_std': (vf1 - vf2).std(),
         }
 
@@ -346,86 +394,61 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
     # Therefore, better to not just rejection sample individual actions and join them with IGM
     # The stitched up rejection sampling action also likely falls out of the support of the joint actions in dataset
     # Use joint actions, scored by joint critic E[Z_joint(s,a)]
-    def joint_critic_dcfm_loss(self, batch, grad_params, rng,
+    def joint_critic_dcfm_loss(self, batch, grad_params, noises, times,
                                joint_actions, next_joint_actions):
-        """DCFM half of the Bellman backup. Shares `next_joint_actions` with
-        joint_critic_bcfm_loss -- see the note in total_loss."""
+        """DCFM half of the Bellman backup. Shares `noises`, `times` and
+        `next_joint_actions` with joint_critic_bcfm_loss -- see the note in total_loss."""
         batch_size = batch['actions'].shape[0]
-        K = self.config['num_agents']
-        A = self.config['action_dim']
-        # WAS (pre-0903): also split off an `action_rng` here to draw its OWN a' --
-        #   rng, n1_rng, n2_rng, t1_rng, t2_rng, action_rng = jax.random.split(rng, 6)
-        rng, n1_rng, n2_rng, t1_rng, t2_rng = jax.random.split(rng, 5)
-
         states = batch['states']
         next_states = batch['next_states']
 
-        # WAS (pre-0903): built locally, duplicating joint_critic_bcfm_loss --
-        #   actions_oh = jax.nn.one_hot(batch['actions'], A)
-        #   joint_actions = actions_oh.reshape(batch_size, K * A)
-        #   next_obs_with_id = batch_concat_agent_id_to_obs(batch['next_observations'])
-        #   next_joint_actions = self._select_next_joint_action_teacher(
-        #       next_obs_with_id, next_states, batch['next_legals'], action_rng)
-
-        times1 = jax.random.uniform(t1_rng, (batch_size, 1))
-        times2 = jax.random.uniform(t2_rng, (batch_size, 1))
-        noises1 = jax.random.normal(n1_rng, (batch_size, 1))
-        noises2 = jax.random.normal(n2_rng, (batch_size, 1))
-
-        # DCFM target, as in Value Flows (value_flows.py:92-123): each twin keeps its
-        # own (eps, t) draw, but at that point BOTH target flows are integrated and
-        # combined by dcfm_agg, and the target velocity is dcfm_agg over both target
-        # fields evaluated at the combined point.
-        # 1011-1013 runs = dcfm_agg='min' (then tied to ret_agg). The pre-10/11 'own'
-        # target (each twin matched only its own target twin, no aggregation) was
-        # removed 10/15; it lives in exp/1011_code_snapshot/mav_flows.py.
+        # DCFM target, as in Value Flows (value_flows.py:92-123) except for the gamma*m
+        # factor on the target velocity (10/21, below): the shared (eps, t) is
+        # integrated to t through BOTH target flows and combined by dcfm_agg, and the
+        # target velocity is dcfm_agg over both target fields at that point. Both online
+        # twins regress at the same point. Before 10/19 each twin drew its own (eps, t).
         dcfm_agg = self.config['dcfm_agg']
         target_names = ('target_joint_critic_flow1', 'target_joint_critic_flow2')
-
-        def target_point(noises, times):
-            """(z_t, target velocity at z_t) for one twin's (eps, t) draw."""
-            z = aggregate_twins(*[
-                self.compute_flow_returns(noises, next_states, next_joint_actions,
-                                          end_times=times, flow_network_name=n)
-                for n in target_names], dcfm_agg)
-            tv = aggregate_twins(*[
-                self.network.select(n)(z, times, next_states, next_joint_actions)
-                for n in target_names], dcfm_agg)
-            return z, jax.lax.stop_gradient(tv)
-
-        znext1, target_vf1 = target_point(noises1, times1)
-        znext2, target_vf2 = target_point(noises2, times2)
+        znext = aggregate_twins(*[
+            self.compute_flow_returns(noises, next_states, next_joint_actions,
+                                      end_times=times, flow_network_name=n)
+            for n in target_names], dcfm_agg)
+        target_vf_next = aggregate_twins(*[
+            self.network.select(n)(znext, times, next_states, next_joint_actions)
+            for n in target_names], dcfm_agg)
 
         r_ = jnp.expand_dims(batch['rewards'], -1)
         m_ = jnp.expand_dims(batch['masks'], -1)
-        noisy_returns1 = r_ + self.config['discount'] * m_ * znext1
-        noisy_returns2 = r_ + self.config['discount'] * m_ * znext2
+        noisy_returns = r_ + self.config['discount'] * m_ * znext
+        # The regression point r + gamma*m*znext moves at gamma*m times the target field's
+        # velocity (chain rule), so that is the target. At a terminal (m=0) the point is
+        # parked at r and the target is 0, which agrees with BCFM's point mass y = r.
+        # WAS (to 10/21, and value_flows.py:115-123): the bare target field, no gamma*m.
+        # At terminals, where next_states = states (envs/smac_utils.py:205), that asked
+        # the field to move like "keep playing from s" at the point where it should stop.
+        target_vf = jax.lax.stop_gradient(self.config['discount'] * m_ * target_vf_next)
 
         vf1 = self.network.select('joint_critic_flow1')(
-            noisy_returns1, times1, states, joint_actions, params=grad_params)
+            noisy_returns, times, states, joint_actions, params=grad_params)
         vf2 = self.network.select('joint_critic_flow2')(
-            noisy_returns2, times2, states, joint_actions, params=grad_params)
+            noisy_returns, times, states, joint_actions, params=grad_params)
 
-        dcfm_loss = ((vf1 - target_vf1) ** 2 + (vf2 - target_vf2) ** 2).mean()
+        dcfm_loss = ((vf1 - target_vf) ** 2 + (vf2 - target_vf) ** 2).mean()
 
-        # --- Shape assertions ---
-        assert znext1.shape == (batch_size, 1)
-        assert noisy_returns1.shape == (batch_size, 1)
+        assert znext.shape == (batch_size, 1)
+        assert noisy_returns.shape == (batch_size, 1)
         assert vf1.shape == (batch_size, 1) and vf2.shape == (batch_size, 1)
-        assert target_vf1.shape == (batch_size, 1)
+        assert target_vf.shape == (batch_size, 1)
 
+        # Removed 10/19: noisy_next_returns_mean, noisy_returns_mean, target_vf_mean,
+        # vf1_mean, vf2_mean -- means of intermediate points and velocities at a random t,
+        # with no reading as a value.
         return dcfm_loss, {
             'dcfm_loss': dcfm_loss,
-            'noisy_next_returns_mean': ((znext1 + znext2) / 2).mean(),
-            'noisy_returns_mean': ((noisy_returns1 + noisy_returns2) / 2).mean(),
-            'target_vf1_mean': target_vf1.mean(),
-            'target_vf2_mean': target_vf2.mean(),
-            'vf1_mean': vf1.mean(),
-            'vf2_mean': vf2.mean(),
             'vf_twin_std': (vf1 - vf2).std(),
         }
 
-    def q_head_factorization_loss(self, batch, grad_params, rng, bootstrap_target):
+    def q_head_factorization_loss(self, batch, grad_params, rng):
 
         # Originally, Q-head network is only trained on one joint action from the offline dataset (given any state)
         # Rejection sampling is ranking samples from BC flow -> can be off-dataset joint actions -> Getting 4 samples from BC flow
@@ -433,159 +456,183 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         batch_size = batch['actions'].shape[0]
         K = self.config['num_agents']
         A = self.config['action_dim']
-        rng, q_rng, cand_rng = jax.random.split(rng, 3)
+        # The middle key was q_rng, V_data's own draws, until 10/17 (see V_data below). It
+        # is still split off so cand_rng, and with it every candidate draw, is unchanged.
+        rng, _, cand_rng = jax.random.split(rng, 3)
 
         states = batch['states']
         obs_with_id = batch_concat_agent_id_to_obs(batch['observations'])     # (B, K, obs_dim + K)
         actions_oh = jax.nn.one_hot(batch['actions'], A)
 
-        return_min = self.config['min_reward'] / (1 - self.config['discount'])
-        return_max = self.config['max_reward'] / (1 - self.config['discount'])
-
         def teacher_V(a_oh, key):
             ## Expectation of joint return distribution E[Z_joint(s,a)]; using 4 samples for some variance reduction
-            joint_a = a_oh.reshape(batch_size, K * A)
-            L = self.config['teacher_mc_samples']
-            eps = jax.random.normal(key, (L, batch_size, 1))   # L independent draws
-
-            def one_step(e):
-                z1 = e + self.network.select('target_joint_critic_flow1')(
-                    e, jnp.zeros_like(e), states, joint_a)
-                z2 = e + self.network.select('target_joint_critic_flow2')(
-                    e, jnp.zeros_like(e), states, joint_a)
-                if self.config['clip_flow_returns']:
-                    z1 = jnp.clip(z1, return_min, return_max)
-                    z2 = jnp.clip(z2, return_min, return_max)
-                return z1, z2
-
-            z1, z2 = jax.vmap(one_step)(eps)          # each (L, batch_size, 1)
-            z1 = z1.mean(axis=0)                       # average over MC draws -> (B, 1)
-            z2 = z2.mean(axis=0)
-            V = aggregate_twins(z1, z2, self.config['q_agg'])
-            return jax.lax.stop_gradient(V)
+            ## Returns (V, V1, V2): q_agg of the twins, and each twin's own readout (diagnostics).
+            return jax.lax.stop_gradient(self._teacher_readout(states, a_oh, key))
 
         def student_Q(a_oh):
             ## factorizes into per-agent q_i, with local observations; Q-MIX
             ## Returns BOTH the per-agent heads (B, K) and the mixed joint value (B, 1).
-            # WAS (pre-0903): returned only the mixer output and threw q_pa away, so the
-            # diagnostics block below re-issued byte-identical q_heads calls (1 for the
-            # dataset action + N_q for the candidates) to recover it. Hand it back
-            # instead. XLA CSE may well have been deduplicating these already -- this is
-            # for clarity, do not budget a speedup against it.
-            #   return self.network.select('mixer')(q_pa, states, params=grad_params)
             q_pa = self.network.select('q_heads')(obs_with_id, a_oh, params=grad_params) # (B, K) - per-agent
             q_tot = self.network.select('mixer')(q_pa, states, params=grad_params) #(B, 1)
             return q_pa, q_tot
 
 
         # ---------------- Dataset action (the in-support anchor) ----------------
-        # Deliberately UNWEIGHTED: this is the one action where the teacher is not
-        # extrapolating, so it always carries full weight. The weighting below triages
-        # among extrapolated points only.
-        V_data = teacher_V(actions_oh, q_rng)
-        # WAS (pre-0903): Q_data = student_Q(actions_oh)
+        # The one action where the teacher is not extrapolating.
+        # 0903: Split cand_rng into two keys, one for candidate sampling and one for teacher evaluation?
+        cand_rng, mc_rng = jax.random.split(cand_rng)
+        # The dataset action is scored with the candidates' L draws (CRN), so V_data and
+        # V_cand differ only through the actions: a candidate equal to the dataset action
+        # gets exactly V_data.
+        # WAS (pre-10/17): its own L draws, so every V_data - V_cand contrast carried
+        # independent MC noise --
+        #   V_data = teacher_V(actions_oh, q_rng)
+        V_data = teacher_V(actions_oh, mc_rng)[0]
         q_per_agent, Q_data = student_Q(actions_oh)   # (B, K), (B, 1)
         loss_data = ((Q_data - V_data) ** 2).mean()
 
         # ---------------- BC-sampled candidate actions ----------------
         N_q = self.config['num_q_candidates']
-        # 0903: Split cand_rng into two keys, one for candidate sampling and one for teacher evaluation?
-        cand_rng, mc_rng = jax.random.split(cand_rng)
         # cand_keys = jax.random.split(mc_rng, N_q)
         _, cand_oh = self._sample_candidates(obs_with_id, batch['legals'], cand_rng, N_q)        # (N_q, B, K, A)
         ## Not splitting keys by each sample
-        V_cand = jax.vmap(teacher_V, in_axes=(0, None))(cand_oh, mc_rng)          # (N_q, B, 1)
+        V_cand, V1_cand, V2_cand = jax.vmap(teacher_V, in_axes=(0, None))(cand_oh, mc_rng)  # (N_q, B, 1) each
         q_pa_cand, Q_cand = jax.vmap(student_Q)(cand_oh)         # (N_q,B,K), (N_q,B,1)
 
         V_flat = V_cand.squeeze(-1)                              # (N_q, B)
         Q_flat = Q_cand.squeeze(-1)                              # (N_q, B) -> This value lives in the Q_mix set
                                                                  # Follows conditions of monotonicity
-        V_cand_std_per_state = V_flat.std(axis=0)                # (B,)
 
-        w_mode = self.config.get('w_mode', 'uniform')
-        w_alpha = self.config.get('w_alpha', 0.1)
-
-        if w_mode == 'uniform':
-            # Exact pre-WQMIX behaviour.
-            w_raw = jnp.ones_like(V_flat)
-
-        elif w_mode == 'soft':
-            # OURS. Standardize per state so w_temp is scale-free ("std devs of candidate
-            # spread") and does not sharpen as returns grow during training.
-            # w_temp -> inf recovers 'uniform'; w_temp -> 0 recovers hard-argmax ('cw').
-            w_temp = self.config['w_temp']
-            V_z = (V_flat - V_flat.mean(axis=0, keepdims=True)) / (
-                V_cand_std_per_state[None, :] + 1e-6)
-            w_raw = jax.nn.softmax(V_z / w_temp, axis=0) * N_q      # (N_q, B)
-
-        elif w_mode == 'ow':
-            w_raw = jnp.where(V_flat > Q_flat, 1.0, w_alpha)        # (N_q, B)
-
-        elif w_mode == 'cw':
-            star_idx = jnp.argmax(V_flat, axis=0)                  # (B,) teacher's central action
-            star = jax.nn.one_hot(star_idx, N_q).T                 # (N_q, B)
-            V_star = V_flat.max(axis=0)                            # (B,) = Qhat*(s, ahat*)
-            y = jax.lax.stop_gradient(bootstrap_target).squeeze(-1)  # (B,)
-            target_larger = jnp.broadcast_to(
-                (y > V_star)[None, :], V_flat.shape)               # (N_q, B), per-state
-            w_raw = jnp.where((star > 0) | target_larger, 1.0, w_alpha)
-
-        else:
-            raise ValueError(f'unknown w_mode: {w_mode!r}')
-        if self.config.get('w_normalize', True):
-            w_cand = w_raw * N_q / (w_raw.sum(axis=0, keepdims=True) + 1e-12)
-        else:
-            w_cand = w_raw
-        w_cand = jax.lax.stop_gradient(w_cand)
-
-        loss_cand = (w_cand[..., None] * (Q_cand - V_cand) ** 2).mean()
+        loss_cand = ((Q_cand - V_cand) ** 2).mean()
 
         loss = loss_data + loss_cand
+
+        # T1 (extraction_tests_spec.md): within-state fit. Uniform MSE spends ~99% of its
+        # weight on per-state levels, while every argmax downstream reads only the
+        # within-state deviations. loss_within == 1 - R^2_within on the batch, so
+        # within_lambda re-weights the objective toward the decision-relevant part.
+        # Identical candidates give dV = dQ = 0 exactly, so they drop out on their own.
+        dV = V_flat - V_flat.mean(axis=0, keepdims=True)         # (N_q, B), teacher stop-grad
+        dQ = Q_flat - Q_flat.mean(axis=0, keepdims=True)         # (N_q, B)
+        dV_ss = jax.lax.stop_gradient((dV ** 2).sum())
+        loss_within = ((dQ - dV) ** 2).sum() / (dV_ss + 1e-6)
+        within_lambda = self.config.get('within_lambda', 0.0)
+        if within_lambda:            # static; the default graph is untouched
+            loss = loss + within_lambda * loss_within
+
+        # Level / within-state split over N_q + 1 options, the dataset action being option
+        # 0 and scored with the candidates' teacher draws (row 7). Per state,
+        #   mean_n (Q_n - V_n)^2 = (Qbar - Vbar)^2 + mean_n (dQ_n - dV_n)^2,
+        # since dQ and dV each sum to 0. q_loss='decomposed' trains on
+        # q_level_lambda * level + within in place of the MSE above; q_level_lambda=1 is
+        # the uniform MSE over the N_q + 1 options (the MSE above weights the dataset
+        # action N_q times a candidate). Only the within part reaches a deployed argmax.
+        # Unlike T1's loss_within this is not normalised, and it includes the data action.
+        V_opt = jnp.concatenate([V_data[None], V_cand], axis=0).squeeze(-1)   # (N_q+1, B)
+        Q_opt = jnp.concatenate([Q_data[None], Q_cand], axis=0).squeeze(-1)   # (N_q+1, B)
+        V_bar, Q_bar = V_opt.mean(axis=0), Q_opt.mean(axis=0)                  # (B,)
+        loss_level = ((Q_bar - V_bar) ** 2).mean()
+        loss_within_opt = (((Q_opt - Q_bar) - (V_opt - V_bar)) ** 2).mean()
+        q_loss = self.config.get('q_loss', 'mse')
+        if q_loss == 'decomposed':
+            if within_lambda:
+                raise ValueError("q_loss='decomposed' replaces the MSE: use it with "
+                                 "within_lambda=0")
+            loss = self.config.get('q_level_lambda', 0.0) * loss_level + loss_within_opt
+        elif q_loss != 'mse':
+            raise ValueError(f'unknown q_loss: {q_loss!r}')
 
         # ---------------------------------------------------------------- #
         #                          DIAGNOSTICS                             #
         # ---------------------------------------------------------------- #
+        # Rebuilt 10/19. The value chain behind every deployed action is
+        #   pool (N BC candidates) -> teacher (joint critic's pick) -> Q_tot -> stitched,
+        # and each group below measures one link on this batch's dataset states:
+        #   pool/     is there anything to choose between?
+        #   teacher/  what does the critic claim choosing is worth, and how sure is it?
+        #   extract/  how much of the teacher's ranking survives into Q_tot and the
+        #             per-agent (stitched, deployed) pick?
+        # Rules, all fixed from the pre-10/19 metrics:
+        #   - Compare ACTION ids, never candidate indices: duplicate candidates are common
+        #     (29% of 5m6m states have all N identical), and index comparisons gave them
+        #     free agreement (spearman_q_vs_v, *_matches_teacher).
+        #   - Agreement and spread are averaged over DISTINCT states only (>= 2 different
+        #     joint candidates); everywhere else every pick is the same action.
+        #   - Top-1 agreement is chance-corrected against picking a uniformly random
+        #     candidate: 0 = no better than one BC draw, 1 = always the teacher's pick.
 
-        # --- Argmax agreement (existing metrics, kept) ---
-        teacher_best = jnp.argmax(V_flat, axis=0)                # (N_q,B) -> (B,)
-        stitched_best = jnp.argmax(q_pa_cand, axis=0)            # (B, K) per-agent pick
-        stitched_matches_teacher = (stitched_best == teacher_best[:, None]).all(axis=-1).mean()
-        student_best = jnp.argmax(Q_flat, axis=0)                # (B,)
-        student_matches_teacher = (student_best == teacher_best).mean()
-        rV = _rank_along_axis0(V_flat)
-        rQ = _rank_along_axis0(Q_flat)
-        rV = rV - rV.mean(axis=0, keepdims=True)
-        rQ = rQ - rQ.mean(axis=0, keepdims=True)
-        spearman = ((rV * rQ).sum(axis=0)
-                    / (jnp.sqrt((rV ** 2).sum(axis=0) * (rQ ** 2).sum(axis=0)) + 1e-6)).mean()
+        f32 = jnp.float32
+        cand_act = jnp.argmax(cand_oh, axis=-1)                                  # (N_q,B,K)
+        same = (cand_act[:, None] == cand_act[None]).all(-1)                     # (N_q,N_q,B)
+        n_distinct = (1.0 / same.sum(1)).sum(0)                                  # (B,)
+        dmask = (n_distinct > 1.5).astype(f32)                                   # distinct states
+        dmean = lambda x: (x * dmask).sum() / (dmask.sum() + 1e-6)
+        rows = jnp.arange(batch_size)
+        pick = lambda scores: cand_act[jnp.argmax(scores, axis=0), rows]         # (B,K) actions
 
-        q_cand_spread_per_agent = q_pa_cand.std(axis=0).mean()
+        # Teacher: its pick, each twin's pick, the gain it sees, its level vs the data.
+        V1_flat, V2_flat = V1_cand.squeeze(-1), V2_cand.squeeze(-1)
+        teach_act = pick(V_flat)
+        V_best, V_mean = V_flat.max(0), V_flat.mean(0)
+        same_joint = lambda x, y: (x == y).all(-1).astype(f32)                   # (..., B)
 
-        assert q_per_agent.shape == (batch_size, K)
-        assert V_data.shape == (batch_size, 1) and Q_data.shape == (batch_size, 1)
-        assert w_cand.shape == (N_q, batch_size)
+        # Stitched (deployed) and mixer picks, scored by the teacher with the same draws (CRN).
+        stitched_best = jnp.argmax(q_pa_cand, axis=0)                            # (B, K)
+        stitch_act = jnp.take_along_axis(cand_act, stitched_best[None], 0).squeeze(0)  # (B,K)
+        V_stitch = teacher_V(jax.nn.one_hot(stitch_act, A), mc_rng)[0].squeeze(-1)
+        student_best = jnp.argmax(Q_flat, axis=0)                                # (B,)
+        V_mix = V_flat[student_best, rows]
+        gain = (V_best - V_mean).sum() + 1e-6
+        # Chance of a uniformly random candidate being the teacher's pick, per state and
+        # per agent; top-1 numbers are reported against it.
+        null_joint = same_joint(cand_act, teach_act[None]).mean(0)               # (B,)
+        null_agent = (cand_act == teach_act[None]).astype(f32).mean(0)           # (B,K)
 
-        return loss, {
+        def chance_corrected(hit, null):
+            h, n = dmean(hit), dmean(null)
+            return (h - n) / (1.0 - n + 1e-6)
+
+        info = {
             'q_head_loss': loss,
             'q_head_loss_data': loss_data,
             'q_head_loss_cand': loss_cand,
-            'v_teacher_mean': V_data.mean(),
-            'q_tot_factor_mean': Q_data.mean(),
-            'q_per_agent_mean': q_per_agent.mean(),
-            'q_per_agent_std_across_agents': q_per_agent.std(axis=-1).mean(),
-            'v_cand_std': V_cand.std(),   # teacher spread across candidates = ranking signal
-            'v_cand_std_per_state': V_cand_std_per_state.mean(),
-            'q_cand_spread_per_agent': q_cand_spread_per_agent,
-            # --- WQMIX weighting (DISABLED 0917 -- see the note above) ---
-            # 'w_ess': ess,                     # N_q = uniform, 1 = hard argmax
-            # 'w_max': w_cand.max(axis=0).mean(),
-            # 'w_min': w_cand.min(axis=0).mean(),
-            # 'w_frac_full': w_frac_full,       # binary modes: fraction at full weight
-            # --- ranking quality (what actually matters) ---
-            'spearman_q_vs_v': spearman,
-            'stitched_matches_teacher': stitched_matches_teacher,
-            'student_matches_teacher': student_matches_teacher,
+            'loss_level': loss_level,
+            'loss_within_opt': loss_within_opt,
+            # --- pool: is there anything to choose between? ---
+            'pool/frac_distinct': dmask.mean(),
+            'pool/n_distinct': n_distinct.mean(),
+            'pool/agent_data_in_pool': (cand_act == batch['actions'][None]).any(0).mean(),
+            # --- teacher: what the critic claims choosing is worth, and how sure it is ---
+            'teacher/v_data_mean': V_data.mean(),
+            'teacher/gain': dmean(V_best - V_mean),
+            'teacher/gain_vs_data': (V_best - V_data[:, 0]).mean(),
+            # Chance-corrected like top1_*: twin 2's pick vs twin 1's, against a random candidate.
+            'teacher/twin_top1_agree': chance_corrected(
+                same_joint(pick(V2_flat), pick(V1_flat)),
+                same_joint(cand_act, pick(V1_flat)[None]).mean(0)),
+            # --- extract: teacher -> Q_tot (mix) -> per-agent argmax (stitch) ---
+            'extract/r2_within': 1.0 - jax.lax.stop_gradient(loss_within),
+            'extract/rho_within': (dQ * dV).sum() / (jnp.sqrt((dQ ** 2).sum() * dV_ss) + 1e-6),
+            'extract/top1_mix': chance_corrected(same_joint(pick(Q_flat), teach_act), null_joint),
+            'extract/top1_stitch': chance_corrected(same_joint(stitch_act, teach_act), null_joint),
+            'extract/agent_agree': chance_corrected((stitch_act == teach_act).astype(f32).mean(-1),
+                                                    null_agent.mean(-1)),
+            'extract/capture_mix': (V_mix - V_mean).sum() / gain,
+            'extract/capture_stitch': (V_stitch - V_mean).sum() / gain,
+            'extract/in_pool': dmean((cand_act == stitch_act[None]).all(-1).any(0).astype(f32)),
         }
+        if 'mc_returns' in batch:
+            # The behaviour policy's discounted return-to-go from s (main.py adds it).
+            G = batch['mc_returns']
+            v = V_data[:, 0]
+            info['teacher/value_bias_mc'] = (v - G).mean()
+            info['teacher/value_corr_mc'] = (((v - v.mean()) * (G - G.mean())).mean()
+                                             / (v.std() * G.std() + 1e-6))
+
+        assert q_per_agent.shape == (batch_size, K)
+        assert V_data.shape == (batch_size, 1) and Q_data.shape == (batch_size, 1)
+
+        return loss, info
 
 
     def _integrate_actor_flow(self, noises, observations, flow_network_name):
@@ -618,13 +665,6 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         #  It is a mechansim that pushes the actor towards
         #  the action that critic scores the highest.
 
-        # NOTE (8/31): this loss is CORRECT and is being correctly minimized. The issue is
-        # architectural, not in the objective: ActorVectorField processes the K axis
-        # independently, so the minimizer is v*_i = E[a_i - eps_i | x_i, t, o_i] -- the
-        # conditioning set excludes o_j and x_j. Each MARGINAL mu_i(a_i|o_i) is exact; the
-        # sampler is their PRODUCT. bc_loss therefore carries no information about joint
-        # sample quality and can descend forever while candidates are uncoordinated.
-
         batch_size = batch['actions'].shape[0]
         K = self.config['num_agents']
         A = self.config['action_dim']
@@ -650,7 +690,6 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         actor_loss = bc_loss
 
         return actor_loss, {
-            'actor_loss': actor_loss,
             'bc_loss': bc_loss,
         }
 
@@ -747,6 +786,7 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
             embedding_dim=config['mixer_embed_dim'],
             hypernet_hidden_dim=config['mixer_hypernet_hidden_dim'],
             init_scale=config['mixer_init_scale'],
+            monotone=config.get('mixer_monotone', True),
         )
 
         actor_bc_flow_def = ActorVectorField(
@@ -782,35 +822,9 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
     def total_loss(self, batch, grad_params, rng):
-        # WAS (pre-0903):
-        #   rng, q_head_rng, bcfm_rng, dcfm_rng, actor_rng = jax.random.split(rng, 5)
-        #   ... and joint_critic_bcfm_loss / joint_critic_dcfm_loss EACH called
-        #   _select_next_joint_action_teacher on the identical batch with a different
-        #   key. That is the single most expensive op in the step (N=8 candidates x
-        #   num_flow_steps Euler steps x B x K actor-BC-flow evals) and it ran twice.
-        #
-        # Two reasons to draw a' ONCE and share it, beyond the ~30% step-time saving:
-        #
-        #   1. a' is not a random variable the objective integrates over. It is an
-        #      ESTIMATOR of the greedy successor action -- the multi-agent stand-in for
-        #      argmax_{a'} Q(s',a'), approximated by an argmax over BC-flow candidates.
-        #      Its randomness is estimation error, not part of the target distribution.
-        #      BCFM (mean-matching) and DCFM (distributional) are two views of ONE
-        #      Bellman operator T: Z(s,a) <- r + gamma*m*Z_target(s',a'). Feeding them
-        #      different a' means the critic is pushed toward the average of T^{a'_1}
-        #      and T^{a'_2}, two operators differing by exactly the candidate-selection
-        #      noise -- on most states the two argmaxes disagree.
-        #   2. a' is an argmax over MC-noisy teacher values (teacher_mc_samples draws),
-        #      so it carries the usual optimism of a max over noisy estimates. Two
-        #      independent optimistic draws summed into one gradient pays that bias
-        #      twice per transition per step, working against ret_agg/q_agg='min'.
-        #
-        # Note this does NOT touch the deliberate per-twin decorrelation inside each
-        # loss (noises1/noises2, times1/times2) -- the twins already shared a single
-        # next_joint_actions within each loss, so one draw per transition was already
-        # the design intent; only the split ACROSS the two losses is removed.
-        rng, q_head_rng, bcfm_rng, dcfm_rng, actor_rng, action_rng, y_rng = \
-            jax.random.split(rng, 7)
+        # The 3rd and 4th keys drew BCFM's and DCFM's own (eps, t) until 10/19. They are
+        # still split off, so every other draw matches earlier runs step for step.
+        t_rng, q_head_rng, _, _, actor_rng, action_rng, y_rng = jax.random.split(rng, 7)
 
         batch_size = batch['actions'].shape[0]
         K = self.config['num_agents']
@@ -822,10 +836,8 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         next_joint_actions = self._select_next_joint_action_teacher(
             next_obs_with_id, batch['next_states'], batch['next_legals'], action_rng)
 
-        # Bootstrap target y = r + gamma * mask * E[Z_target(s', a')], built ONCE.
-        # Hoisted out of joint_critic_bcfm_loss (0903) because the paper-faithful
-        # CW-QMIX condition in q_head_factorization_loss compares against y, and
-        # integrating the two target ODEs a second time for it would be waste.
+        # Bootstrap target y = r + gamma * mask * E[Z_target(s', a')], built once.
+
         next_states = batch['next_states']
         next_q_noises = jax.random.normal(y_rng, (batch_size, 1))
         next_z1 = self.compute_flow_returns(
@@ -841,13 +853,17 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
                             * jnp.expand_dims(batch['masks'], axis=-1)
                             * next_returns)                       # (B, 1)
 
+        # Value Flows noise sharing (value_flows.py:64-123; paper App C.1 fn 4): y's eps and
+        # one t are where BCFM and DCFM start, for both twins.
+        times = jax.random.uniform(t_rng, (batch_size, 1))
+
         q_head_loss, q_head_info = self.q_head_factorization_loss(
-            batch, grad_params, q_head_rng, bootstrap_target)
+            batch, grad_params, q_head_rng)
         bcfm_loss, bcfm_info = self.joint_critic_bcfm_loss(
-            batch, grad_params, bcfm_rng, joint_actions, next_joint_actions,
+            batch, grad_params, next_q_noises, times, joint_actions, next_joint_actions,
             bootstrap_target)
         dcfm_loss, dcfm_info = self.joint_critic_dcfm_loss(
-            batch, grad_params, dcfm_rng, joint_actions, next_joint_actions)
+            batch, grad_params, next_q_noises, times, joint_actions, next_joint_actions)
         a_loss, actor_info = self.actor_loss(
             batch, grad_params, actor_rng)
 
@@ -857,7 +873,8 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         total = critic_loss + q_head_loss + a_loss
 
         info = {'total_loss': total, 'critic_loss': critic_loss}
-        info.update({f'q_head/{k}': v for k, v in q_head_info.items()})
+        # Diagnostics that already carry a group ('pool/', 'teacher/', 'extract/') keep it.
+        info.update({k if '/' in k else f'q_head/{k}': v for k, v in q_head_info.items()})
         info.update({f'bcfm/{k}': v for k, v in bcfm_info.items()})
         info.update({f'dcfm/{k}': v for k, v in dcfm_info.items()})
         info.update({f'actor/{k}': v for k, v in actor_info.items()})
@@ -880,6 +897,10 @@ class MAVFlowAgent(flax.struct.PyTreeNode):
         def loss_fn(grad_params):
             return self.total_loss(batch, grad_params, rng=loss_rng)
 
+        # grad/norm is an L1 sum of per-leaf L2 norms over every module at once, so it
+        # mixes the critic, q_head and actor losses. Per-module norms were tried 10/19 and
+        # dropped: any extra reduction on the gradients changes XLA's fusion and moves the
+        # mixer update by ~1 ulp, which breaks the bit-identity checks.
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
 
         # Polyak EMA on both joint critics
@@ -909,14 +930,18 @@ def get_config():
             discount=0.99,  # Discount factor.
             tau=0.005,  # Target network update rate.
 
-            # Twin-critic aggregation, each 'mean' | 'min'. All were 'min' on every run
-            # 0716-1013 (DCFM had none before 10/11); all went to 'mean' on 10/15
-            # (MAC-Flow App. E, the Value Flows default).
             ret_agg='mean',  # BCFM bootstrap target y, and a' scoring.
             dcfm_agg='mean',  # DCFM target point and velocity.
             q_agg='mean',  # q_head teacher V, i.e. what the deployed policy ranks by.
             clip_flow_actions=False,  # Whether to clip the intermediate flow actions.
-            clip_flow_returns=True,  # Whether to clip flow returns.
+            # T1 (extraction_tests_spec.md). Both defaults leave training unchanged.
+            within_lambda=0.0,  # weight of the within-state (centred) q_head loss, = 1 - R^2_within
+            mixer_monotone=True,  # False drops the mixer's |w| (diagnostic; breaks IGM)
+            # q_head loss: 'mse' (dataset action + candidates, as since 0903) or 'decomposed'
+            # (within-state MSE over the dataset action + candidates, + q_level_lambda * level).
+            q_loss='mse',
+            q_level_lambda=0.0,  # weight of the across-state level term under q_loss='decomposed'
+            clip_flow_returns=True,  # Clip t=1 flow returns (ODE endpoint, one-step teacher V) to the return bounds.
             dcfm_lambda=1.0,  # Distributional conditional flow matching loss coefficient.
             bcfm_lambda=1.0,  # Bootstrapped conditional flow matching loss coefficient.
             alpha=10.0,  # Flow distillation coefficient.
@@ -934,11 +959,6 @@ def get_config():
 
             t_embed_frequencies = 8, # Number of frequencies for sinusoidal time embedding
             target_select_full_ode = False,  # Whether to use full ODE integration for target selection
-
-            w_mode = 'uniform', # or "soft" | "ow" | "cw"
-            w_temp = 1.0,
-            w_alpha = 0.1,
-            w_normalize = False,
         )
     )
     return config

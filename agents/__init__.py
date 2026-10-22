@@ -11,6 +11,7 @@ from agents.value_flows import ValueFlowsAgent
 from agents.mav_flows_per_agent import MAVFlowPerAgentAgent
 from agents.mav_flows import MAVFlowAgent
 from agents.mav_flows_continuous import MAVFlowContinuousAgent
+from agents.qmix_cql import QMIXCQLAgent
 
 agents = dict(
     c51=C51Agent,
@@ -26,4 +27,5 @@ agents = dict(
     mav_flow = MAVFlowAgent,
     mav_flow_per_agent = MAVFlowPerAgentAgent,
     mav_flow_continuous=MAVFlowContinuousAgent,
+    qmix_cql=QMIXCQLAgent,
 )

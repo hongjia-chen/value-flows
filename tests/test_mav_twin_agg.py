@@ -61,8 +61,10 @@ def _joint(batch):
 
 
 def _dcfm(agent, batch):
+    eps = jax.random.normal(jax.random.PRNGKey(7), (B, 1))
+    t = jax.random.uniform(jax.random.PRNGKey(8), (B, 1))
     return agent.joint_critic_dcfm_loss(
-        batch, agent.network.params, jax.random.PRNGKey(7), _joint(batch), _joint(batch))
+        batch, agent.network.params, eps, t, _joint(batch), _joint(batch))
 
 
 def _with_identical_target_twins(agent):
@@ -93,16 +95,34 @@ def test_dcfm_agg_is_moot_when_target_twins_coincide():
     loss_mean, info_mean = _dcfm(_with_identical_target_twins(mean), batch)
     loss_min, info_min = _dcfm(_with_identical_target_twins(mn), batch)
     np.testing.assert_allclose(loss_mean, loss_min, rtol=1e-6)
-    np.testing.assert_allclose(info_mean['target_vf2_mean'], info_min['target_vf2_mean'], rtol=1e-6)
 
 
-def test_min_dcfm_target_sits_below_mean_target():
-    # Same key -> same (eps, t) per twin, so min(z1, z2) <= (z1 + z2) / 2 pointwise.
-    mean, batch = _agent(dcfm_agg='mean')
-    mn, _ = _agent(dcfm_agg='min')
-    _, info_mean = _dcfm(mean, batch)
-    _, info_min = _dcfm(mn, batch)
-    assert float(info_min['noisy_next_returns_mean']) < float(info_mean['noisy_next_returns_mean'])
+def _dcfm_reference(agent, batch):
+    # The DCFM loss written out: target point and velocity are dcfm_agg over both target
+    # twins at the shared (eps, t), and both online twins regress at that point.
+    eps = jax.random.normal(jax.random.PRNGKey(7), (B, 1))
+    t = jax.random.uniform(jax.random.PRNGKey(8), (B, 1))
+    agg, ja, ns = agent.config['dcfm_agg'], _joint(batch), batch['next_states']
+    names = ('target_joint_critic_flow1', 'target_joint_critic_flow2')
+    znext = aggregate_twins(*[agent.compute_flow_returns(eps, ns, ja, end_times=t, flow_network_name=n)
+                              for n in names], agg)
+    gm = agent.config['discount'] * batch['masks'][:, None]
+    # 10/21: the target velocity is gamma*m times the target field (tests/test_mav_dcfm_mask.py).
+    target = gm * aggregate_twins(*[agent.network.select(n)(znext, t, ns, ja) for n in names], agg)
+    x = batch['rewards'][:, None] + gm * znext
+    return sum(((agent.network.select(n)(x, t, batch['states'], ja) - target) ** 2).mean()
+               for n in ('joint_critic_flow1', 'joint_critic_flow2'))
+
+
+def test_dcfm_loss_uses_the_dcfm_agg_target():
+    # WAS (pre-10/19): read the min-vs-mean target off the logged noisy_next_returns_mean,
+    # which was dropped from the logs.
+    losses = {}
+    for agg in ('mean', 'min'):
+        agent, batch = _agent(dcfm_agg=agg)
+        losses[agg] = float(_dcfm(agent, batch)[0])
+        np.testing.assert_allclose(losses[agg], float(_dcfm_reference(agent, batch)), rtol=1e-5)
+    assert losses['mean'] != losses['min']
 
 
 def test_unknown_aggregation_fails_early():

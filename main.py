@@ -58,14 +58,34 @@ flags.DEFINE_integer('balanced_sampling', 0, 'Whether to use balanced sampling f
 # across checkpoints. Set to 0 to disable.
 flags.DEFINE_integer('churn_probe_size', 256, 'Fixed probe-batch size for churn metric (0 disables).')
 
+# SMAC eval arms (utils/evaluate_smac.py), each played for eval_episodes:
+#   'deployed' the policy (logged under the old evaluation/* names),
+#   'bc'       candidate 0 = one BC draw, no selection: the floor (evaluation/bc/*),
+#   'teacher'  the joint critic's pick among the same candidates (evaluation/teacher/*).
+#              It reads the global state, so it is a centralised reference.
+# deployed - bc is what selection buys; teacher - deployed is what decentralised
+# extraction loses; teacher - bc is what the critic's own ranking is worth. The arms run
+# one after another in the one eval env, so they are NOT paired: compare them with the
+# logged win_rate_se. On SMACv2 every extra episode also shifts the training batch stream
+# (eval consumes np.random; see the B8 note in the eval-harness pitfalls).
+flags.DEFINE_string('eval_arms', 'deployed,bc,teacher', "Comma list; must include 'deployed'.")
+# On-policy diagnostics (onpolicy/*) from the deployed arm's own visited states: critic
+# calibration against the return actually collected, and how settled its choices are.
+# The bc arm's own states give gap/selection_predicted. See onpolicy_metrics in
+# utils/evaluate_smac.py and metrics_guide.md.
+flags.DEFINE_integer('eval_diagnostics', 1, 'Log onpolicy/* and gap/* diagnostics.')
+
 # Which recorder produced the SMAC vault being loaded — this selects the eval env
 # and therefore the observation spec, so it must match the vault:
-#   'og_marl' : standard og-marl SMACv1 recording (5m_vs_6m, 3s5z_vs_3s6z, 3m, ...)
-#   'omiga'   : the OMIGA paper's SMACv1 variant (corridor). Its env appends an
-#               agent-id one-hot to each observation and uses per-agent states, so
-#               corridor's obs is 346 rather than the 156 the standard env emits.
+#   'og_marl' : standard og-marl SMACv1 recording (5m_vs_6m, 3s5z_vs_3s6z, 3m, ...),
+#               and the CFCQL vaults (3s_vs_5z), which use the same observations
+#   'omiga'   : the OMIGA paper's SMACv1 variant (2c_vs_64zg, 6h_vs_8z, corridor). Its
+#               env appends an agent-id one-hot to each observation and uses per-agent
+#               states, so corridor's obs is 346 rather than the 156 the standard env emits.
+#   'auto'    : whichever of the two emits the vault's observation size (og_marl first).
 # main() verifies the choice against the dataset and fails fast on a mismatch.
-flags.DEFINE_string('smac_env_source', 'og_marl', "SMAC eval env recorder: 'og_marl' or 'omiga'.")
+# WAS (pre-10/17): default 'og_marl', so OMIGA maps needed the flag spelled out.
+flags.DEFINE_string('smac_env_source', 'auto', "SMAC eval env recorder: 'og_marl', 'omiga' or 'auto'.")
 
 config_flags.DEFINE_config_file('agent', 'agents/value_flows.py', lock_config=False)
 
@@ -121,12 +141,15 @@ def main(_):
     if is_harness and FLAGS.online_steps > 0:
         raise ValueError('Harness envs support offline training and evaluation only; set --online_steps=0.')
     if is_smac:
-        from og_marl.environments import get_environment
+        from envs.smac_utils import make_smac_eval_env
         map_source, scenario = smac_info
+        ds_obs_dim = int(np.asarray(train_dataset['observations']).shape[-1])
+        eval_env, env_source, env_obs_dim = make_smac_eval_env(
+            map_source, scenario, ds_obs_dim, source=FLAGS.smac_env_source, seed=FLAGS.seed)
         print(f'Building SMAC eval env: {map_source} / {scenario} '
-              f'(dataset_source={FLAGS.smac_env_source})')
-        eval_env = get_environment(FLAGS.smac_env_source, map_source, scenario, seed=FLAGS.seed)
+              f'(dataset_source={env_source}, flag={FLAGS.smac_env_source})')
 
+        # Why the obs-size probe above exists, and why it must not reset the env:
         # The vaults under smac_v1/ were not all recorded by the same pipeline, and
         # the recorder determines the observation spec. Picking the wrong source
         # builds an env whose observations do not match the dataset the agent was
@@ -145,17 +168,14 @@ def main(_):
         # pure arithmetic over map params set in __init__, so it needs no reset and
         # does not boot SC2. The OMIGA env returns a list whose [0] is the total
         # (it folds in the agent-id one-hot); vanilla SMAC returns an int.
-        ds_obs_dim = int(np.asarray(train_dataset['observations']).shape[-1])
-        obs_size = eval_env._environment.get_obs_size()
-        env_obs_dim = int(obs_size[0] if isinstance(obs_size, (list, tuple)) else obs_size)
         if ds_obs_dim != env_obs_dim:
             raise ValueError(
                 f'SMAC observation mismatch for {scenario}: the vault provides '
-                f'{ds_obs_dim}-dim observations but the '
-                f'"{FLAGS.smac_env_source}" env provides {env_obs_dim}. The eval '
-                f'env was built by the wrong recorder. Re-run with '
-                f'--smac_env_source=omiga (or =og_marl) to match the vault. '
-                f'Known: 5m_vs_6m/3s5z_vs_3s6z are og_marl, corridor is omiga.')
+                f'{ds_obs_dim}-dim observations but the "{env_source}" env provides '
+                f'{env_obs_dim} (flag {FLAGS.smac_env_source}). The eval env was built by the wrong '
+                f'recorder. Re-run with --smac_env_source=auto, =omiga or =og_marl to '
+                f'match the vault. Known: og_marl core maps and 3s_vs_5z are og_marl; '
+                f'2c_vs_64zg, 6h_vs_8z and corridor are omiga.')
         print(f'[OK] SMAC obs parity: dataset={ds_obs_dim} env={env_obs_dim}')
     elif is_mpe:
         from envs.mpe_omar import MPEOMAR
@@ -183,6 +203,13 @@ def main(_):
     # Initialize agent.
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
+
+    # The behaviour policy's discounted return-to-go at every transition, for the critic's
+    # teacher/value_bias_mc and value_corr_mc diagnostics (agents/mav_flows.py).
+    if config['agent_name'] in ('mav_flow', 'qmix_cql'):
+        from utils.datasets import discounted_returns_to_go
+        train_dataset['mc_returns'] = discounted_returns_to_go(
+            train_dataset['rewards'], train_dataset['terminals'], config['discount'])
 
     # Set up datasets. 
     train_dataset = Dataset.create(**train_dataset)
@@ -242,6 +269,7 @@ def main(_):
         churn = dict(
             obs_id=batch_concat_agent_id_to_obs(probe_batch['observations']),
             legals=probe_batch['legals'],
+            states=probe_batch['states'],
             key=jax.random.PRNGKey(12345),   # FIXED key: flips are pure param drift
             prev=None,
             anchor=None,
@@ -265,6 +293,12 @@ def main(_):
     
     rng = jax.random.PRNGKey(FLAGS.seed)
     expl_metrics = dict()
+    # training/* rows are the MEAN over every update in the log interval, accumulated on
+    # device (one jitted add per step, no host sync). Before 10/19 a row was the single
+    # batch of the logging step: for the extraction metrics that one-batch noise (sd
+    # ~0.03-0.06) was as large as a third of their whole 50k->500k trend.
+    add_info = jax.jit(lambda acc, info: jax.tree_util.tree_map(lambda a, b: a + b, acc, info))
+    info_sum, info_count = None, 0
     done = True
     for i in tqdm.tqdm(range(1, FLAGS.offline_steps + FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
         if i <= FLAGS.offline_steps:
@@ -324,9 +358,14 @@ def main(_):
             else:
                 agent, update_info = agent.update(batch)
 
+        info_sum = update_info if info_sum is None else add_info(info_sum, update_info)
+        info_count += 1
+
         # Log metrics.
         if i % FLAGS.log_interval == 0:
-            train_metrics = {f'training/{k}': v for k, v in update_info.items()}
+            mean_info = {k: v / info_count for k, v in jax.device_get(info_sum).items()}
+            info_sum, info_count = None, 0
+            train_metrics = {f'training/{k}': v for k, v in mean_info.items()}
             if val_dataset is not None:
                 val_batch = val_dataset.sample(config['batch_size'])
                 _, val_info = val_loss_fn(agent, val_batch, jax.random.PRNGKey(i))
@@ -347,9 +386,15 @@ def main(_):
             # Runs the greedy policy on a FIXED probe set with a FIXED key, then
             # diffs the joint actions against the previous checkpoint and the
             # first (anchor) checkpoint. Pure reads; does not touch training state.
-            if churn is not None:
-                cur_probe = agent.sample_actions_rejection(
-                    churn['obs_id'], churn['legals'], churn['key'])   # (probe_size, K)
+            # Skipped at step 1: the untrained policy is no anchor (before 10/19 it was, so
+            # churn_vs_anchor measured drift from noise; it never reached eval.csv anyway).
+            if churn is not None and i > 1:
+                if hasattr(agent, 'act'):   # scalar-Q baselines (agents/qmix_cql.py)
+                    cur_probe = agent.act(churn['obs_id'], churn['legals'], churn['states'],
+                                          churn['key'])[0]
+                else:
+                    cur_probe = agent.sample_actions_rejection(
+                        churn['obs_id'], churn['legals'], churn['key'])   # (probe_size, K)
                 if churn['prev'] is not None:
                     eval_metrics['churn/greedy_flip_rate_vs_prev'] = float(
                         (cur_probe != churn['prev']).mean())
@@ -363,18 +408,59 @@ def main(_):
             if is_smac:
                 # OG-MARL eval via evaluate_smac (matches MAC-Flow's _evaluate)
                 from utils.evaluate_smac import evaluate_smac
-                results = evaluate_smac(
-                    agent=agent, env=eval_env,
-                    num_episodes=FLAGS.eval_episodes, seed=i, verbose=False,
-                )
-                eval_info = {
-                    'mean_episode_return': results['mean_return'],
-                    'std_episode_return': results['std_return'],
-                    'max_episode_return': results['max_return'],
-                    'min_episode_return': results['min_return'],
-                    'win_rate': results['win_rate'],
-                    'mean_episode_length': results['mean_length'],
-                }
+                arms = [a for a in FLAGS.eval_arms.split(',') if a]
+                if 'deployed' not in arms:
+                    raise ValueError(f"--eval_arms must include 'deployed', got {arms}")
+                # The references mean nothing for the untrained agent at step 1, and the
+                # scalar-Q baselines (agents/qmix_cql.py) have no BC pool or teacher.
+                arms = ['deployed'] + ([a for a in arms if a != 'deployed']
+                                       if i > 1 and hasattr(agent, 'eval_step') else [])
+                eval_info, disc, pred = {}, {}, {}
+                for arm in arms:
+                    results = evaluate_smac(
+                        agent=agent, env=eval_env,
+                        num_episodes=FLAGS.eval_episodes, seed=i, verbose=False, arm=arm,
+                        diagnostics=bool(FLAGS.eval_diagnostics),
+                    )
+                    disc[arm] = results['mean_discounted_return']
+                    pred[arm] = results.get('onpolicy', {}).get('pred_gap_to_teacher')
+                    if arm == 'deployed':
+                        # Removed 10/19: std/max/min_episode_return (they described the
+                        # spread of 50 returns, not the policy).
+                        eval_info.update({
+                            'mean_episode_return': results['mean_return'],
+                            'return_se': results['return_se'],
+                            'discounted_return': results['mean_discounted_return'],
+                            'win_rate': results['win_rate'],
+                            'win_rate_se': results['win_rate_se'],
+                            'mean_episode_length': results['mean_length'],
+                        })
+                        for k, v in results.get('onpolicy', {}).items():
+                            eval_metrics[f'onpolicy/{k}'] = v
+                    else:
+                        eval_info.update({
+                            f'{arm}/win_rate': results['win_rate'],
+                            f'{arm}/win_rate_se': results['win_rate_se'],
+                            f'{arm}/mean_episode_return': results['mean_return'],
+                            f'{arm}/return_se': results['return_se'],
+                            f'{arm}/discounted_return': results['mean_discounted_return'],
+                            f'{arm}/mean_episode_length': results['mean_length'],
+                        })
+                        if 'onpolicy' in results:   # the critic's calibration on this arm's states
+                            eval_info[f'{arm}/value_bias'] = results['onpolicy']['value_bias']
+                # The two gaps that localise a run, each MEASURED (discounted return from the
+                # first state, teacher arm minus the other arm; unpaired, SE ~ return_se * 1.4)
+                # and PREDICTED by the critic (onpolicy pred_gap_to_teacher on the other arm's
+                # own states; performance-difference lemma, since the critic is the teacher
+                # policy's Q). selection = what the critic's choosing is worth over one BC
+                # draw; extraction = what the deployed per-agent policy loses against it.
+                # predicted >> measured = the critic over-promises (3s5z, 2s3z in the 10/19
+                # probe); predicted ~ measured = it is honest (5m6m).
+                for name, arm in (('selection', 'bc'), ('extraction', 'deployed')):
+                    if 'teacher' in disc and arm in disc:
+                        eval_metrics[f'gap/{name}_measured'] = disc['teacher'] - disc[arm]
+                        if pred.get(arm) is not None:
+                            eval_metrics[f'gap/{name}_predicted'] = pred[arm]
                 renders = []
             elif is_harness:
                 from utils.evaluate_marl import evaluate_marl

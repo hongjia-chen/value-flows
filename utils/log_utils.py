@@ -20,16 +20,26 @@ class CsvLogger:
 
     def log(self, row, step):
         row['step'] = step
+        filtered_row = {k: v for k, v in row.items() if not isinstance(v, self.disallowed_types)}
         if self.file is None:
             self.file = open(self.path, 'w')
             if self.header is None:
-                self.header = [k for k, v in row.items() if not isinstance(v, self.disallowed_types)]
-                self.file.write(','.join(self.header) + '\n')
-            filtered_row = {k: v for k, v in row.items() if not isinstance(v, self.disallowed_types)}
-            self.file.write(','.join([str(filtered_row.get(k, '')) for k in self.header]) + '\n')
-        else:
-            filtered_row = {k: v for k, v in row.items() if not isinstance(v, self.disallowed_types)}
-            self.file.write(','.join([str(filtered_row.get(k, '')) for k in self.header]) + '\n')
+                self.header = list(filtered_row)
+            self.file.write(','.join(self.header) + '\n')
+        new_keys = [k for k in filtered_row if k not in self.header]
+        if new_keys:
+            # A key first seen after row 0 used to be dropped for the whole run, because the
+            # header was frozen at the first row. main.py's churn metrics need two evals, so
+            # they never reached eval.csv before 10/19. Widen the header and rewrite.
+            self.file.close()
+            with open(self.path) as f:
+                old_rows = f.read().splitlines()[1:]
+            self.header = self.header + new_keys
+            self.file = open(self.path, 'w')
+            self.file.write(','.join(self.header) + '\n')
+            for line in old_rows:
+                self.file.write(line + ',' * len(new_keys) + '\n')
+        self.file.write(','.join([str(filtered_row.get(k, '')) for k in self.header]) + '\n')
         self.file.flush()
 
     def close(self):

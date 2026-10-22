@@ -171,3 +171,18 @@ class ReplayBuffer(Dataset):
     def clear(self):
         """Clear the replay buffer."""
         self.size = self.pointer = 0
+
+
+def discounted_returns_to_go(rewards, terminals, discount):
+    """G_t = r_t + discount * G_{t+1}, restarting after every step with terminals > 0 (any
+    episode end). Steps after the last episode end get the partial sum to the data's end."""
+    r = np.asarray(rewards, dtype=np.float64).tolist()
+    end = (np.asarray(terminals) > 0).tolist()
+    out = np.zeros(len(r), dtype=np.float32)
+    g = 0.0
+    for t in range(len(r) - 1, -1, -1):
+        if end[t]:
+            g = 0.0
+        g = r[t] + discount * g
+        out[t] = g
+    return out
